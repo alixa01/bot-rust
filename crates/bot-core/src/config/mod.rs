@@ -195,6 +195,8 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     let market_lookup_max_wait_ms = floor_u64_env("MARKET_LOOKUP_MAX_WAIT_MS", 12000.0)?;
     let order_retry_interval_ms = floor_u64_env("ORDER_RETRY_INTERVAL_MS", 1000.0)?;
     let order_max_attempts = floor_u64_env("ORDER_MAX_ATTEMPTS", 4.0)?;
+    let status_poll_interval_ms = floor_u64_env("STATUS_POLL_INTERVAL_MS", 500.0)?;
+    let status_poll_grace_sec = floor_u64_env("STATUS_POLL_GRACE_SECONDS", 6.0)?;
 
     let loss_cooldown_minutes = floor_u64_env("LOSS_COOLDOWN_MINUTES", 0.0)?;
     let total_loss_trades = floor_u64_env("TOTAL_LOSS_TRADES", 0.0)?;
@@ -327,6 +329,9 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     if order_max_attempts == 0 {
         bail!("ORDER_MAX_ATTEMPTS must be > 0");
     }
+    if status_poll_interval_ms == 0 {
+        bail!("STATUS_POLL_INTERVAL_MS must be > 0");
+    }
     if live_price_max_staleness_ms == 0 {
         bail!("LIVE_PRICE_MAX_STALENESS_MS must be > 0");
     }
@@ -410,6 +415,8 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
         market_lookup_max_wait_ms,
         order_retry_interval_ms,
         order_max_attempts,
+        status_poll_interval_ms,
+        status_poll_grace_sec,
         polymarket_clob_url,
         polymarket_gamma_url,
         binance_base_url,

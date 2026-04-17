@@ -57,6 +57,46 @@ async fn fetch_from_any_binance(binance_base_url: &str, path: &str) -> Result<re
     Err(last_error.unwrap_or_else(|| anyhow!("all binance endpoints failed")))
 }
 
+fn parse_kline_price(rows: &Value, candle_index: usize, field_index: usize, field_name: &str) -> Result<f64> {
+    let row = rows
+        .as_array()
+        .and_then(|arr| arr.get(candle_index))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing Binance candle index {candle_index}"))?;
+
+    let parsed = row
+        .get(field_index)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("invalid {field_name} field from Binance"))?
+        .parse::<f64>()?;
+
+    if !parsed.is_finite() || parsed <= 0.0 {
+        bail!("invalid {field_name} price from Binance");
+    }
+
+    Ok(parsed)
+}
+
+pub async fn fetch_window_open_close(config: &Config, window_start_sec: u64) -> Result<(f64, f64)> {
+    let path = format!(
+        "/klines?symbol=BTCUSDT&interval=1m&startTime={}&limit=5",
+        window_start_sec.saturating_mul(1000)
+    );
+
+    let response = fetch_from_any_binance(&config.binance_base_url, &path).await?;
+    let rows: Value = response.json().await?;
+
+    let candle_count = rows.as_array().map(|arr| arr.len()).unwrap_or(0);
+    if candle_count < 5 {
+        bail!("insufficient 1m candles to resolve 5m window");
+    }
+
+    let open_price = parse_kline_price(&rows, 0, 1, "open")?;
+    let close_price = parse_kline_price(&rows, 4, 4, "close")?;
+
+    Ok((open_price, close_price))
+}
+
 pub async fn fetch_window_open_price(config: &Config, window_start_sec: u64) -> Result<f64> {
     let path = format!(
         "/klines?symbol=BTCUSDT&interval=1m&startTime={}&limit=1",

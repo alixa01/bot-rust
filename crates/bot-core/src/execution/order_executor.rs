@@ -9,8 +9,6 @@ use crate::types::{ExecutionResult, ExecutionStatus, Config};
 use crate::utils::logger::{log_error, log_info, log_warn};
 use crate::utils::time::{now_sec, sleep_ms};
 
-const STATUS_POLL_INTERVAL_MS: u64 = 2_000;
-
 #[derive(Debug, Clone)]
 struct EntryDiagnostics {
     time_budget_start_sec: u64,
@@ -97,6 +95,10 @@ fn clamp_price(price: f64) -> f64 {
     }
 
     price.max(0.01).min(0.99)
+}
+
+fn status_poll_deadline_sec(close_time_sec: u64, status_poll_grace_sec: u64) -> u64 {
+    close_time_sec.saturating_add(status_poll_grace_sec)
 }
 
 fn buy_band_reject_reason(price: f64, config: &Config) -> Option<&'static str> {
@@ -410,7 +412,7 @@ async fn poll_final_order_status(
                     order_id
                 ),
             );
-            sleep_ms(STATUS_POLL_INTERVAL_MS).await;
+            sleep_ms(config.status_poll_interval_ms).await;
             continue;
         };
 
@@ -425,7 +427,7 @@ async fn poll_final_order_status(
                     truncate_text(&status_value.to_string(), 220)
                 ),
             );
-            sleep_ms(STATUS_POLL_INTERVAL_MS).await;
+            sleep_ms(config.status_poll_interval_ms).await;
             continue;
         };
 
@@ -507,7 +509,7 @@ async fn poll_final_order_status(
             )));
         }
 
-        sleep_ms(STATUS_POLL_INTERVAL_MS).await;
+        sleep_ms(config.status_poll_interval_ms).await;
     }
 
     Ok(PollStatusOutcome::Timeout)
@@ -600,11 +602,16 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
         return Ok(None);
     }
 
+    let poll_until_sec = status_poll_deadline_sec(
+        params.close_time_sec,
+        params.config.status_poll_grace_sec,
+    );
+
     match poll_final_order_status(
             params.config,
             params.client,
             &order_id,
-            params.close_time_sec,
+            poll_until_sec,
             SpentComputationContext {
                 mode: SpentComputationMode::MarketBuyRequestedStake,
                 requested_stake_usd: Some(params.stake_usd),
@@ -617,6 +624,15 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
         PollStatusOutcome::Timeout => {
             let mut raw = to_raw_map(post_result);
             raw.insert("reason".to_owned(), json!("order_status_poll_timeout"));
+            raw.insert(
+                "statusPollIntervalMs".to_owned(),
+                json!(params.config.status_poll_interval_ms),
+            );
+            raw.insert(
+                "statusPollGraceSec".to_owned(),
+                json!(params.config.status_poll_grace_sec),
+            );
+            raw.insert("statusPollUntilSec".to_owned(), json!(poll_until_sec));
 
             Ok(Some(ExecutionResult {
                 status: ExecutionStatus::Pending,
@@ -682,11 +698,16 @@ async fn submit_limit_fallback(
         return Ok(None);
     }
 
+    let poll_until_sec = status_poll_deadline_sec(
+        params.close_time_sec,
+        params.config.status_poll_grace_sec,
+    );
+
     match poll_final_order_status(
             params.config,
             params.client,
             &order_id,
-            params.close_time_sec,
+            poll_until_sec,
             SpentComputationContext {
                 mode: SpentComputationMode::FillSizeXPrice,
                 requested_stake_usd: None,
@@ -699,6 +720,15 @@ async fn submit_limit_fallback(
         PollStatusOutcome::Timeout => {
             let mut raw = to_raw_map(post_result);
             raw.insert("reason".to_owned(), json!("order_status_poll_timeout"));
+            raw.insert(
+                "statusPollIntervalMs".to_owned(),
+                json!(params.config.status_poll_interval_ms),
+            );
+            raw.insert(
+                "statusPollGraceSec".to_owned(),
+                json!(params.config.status_poll_grace_sec),
+            );
+            raw.insert("statusPollUntilSec".to_owned(), json!(poll_until_sec));
 
             Ok(Some(ExecutionResult {
                 status: ExecutionStatus::Pending,

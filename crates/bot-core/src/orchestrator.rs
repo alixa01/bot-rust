@@ -1,13 +1,22 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::data::market_discovery::fetch_market_by_slug;
 use crate::data::orderbook::fetch_orderbook_snapshot;
 use crate::execution::order_executor::execute_live_entry;
 use crate::notifications::telegram_notifier::{create_telegram_notifier, TelegramNotifier};
-use crate::types::{DiscoveredMarket, MarketSide, Config};
+use crate::settlement::result_resolver::resolve_window_outcome;
+use crate::settlement::settlement_service::{compute_trade_pnl, process_pending_claim};
+use crate::storage::trade_logger::{
+    log_trade_record, read_trade_records, update_trade_claim_status, ClaimStatusUpdate,
+};
+use crate::types::{
+    ClaimStatus, DiscoveredMarket, ExecutionStatus, MarketSide, PendingClaim, TradeRecord, Config,
+};
 use crate::utils::logger::{log_cycle_separator, log_info, log_warn};
 use crate::utils::time::{build_window, now_sec, sleep_ms, sleep_until};
 
@@ -31,10 +40,367 @@ struct SideCandidate {
     bid_price: f64,
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn trade_id(window_start_sec: u64) -> String {
+    format!("v2_{}_{}", window_start_sec, Uuid::new_v4().simple())
+}
+
+fn clip_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+
+    value.chars().take(max_chars).collect()
+}
+
+fn execution_status_label(status: ExecutionStatus) -> &'static str {
+    match status {
+        ExecutionStatus::Pending => "PENDING",
+        ExecutionStatus::Filled => "FILLED",
+        ExecutionStatus::Partial => "PARTIAL",
+        ExecutionStatus::Cancelled => "CANCELLED",
+        ExecutionStatus::Failed => "FAILED",
+        ExecutionStatus::Skipped => "SKIPPED",
+    }
+}
+
+fn trade_result_label(won: bool) -> &'static str {
+    if won {
+        "WIN"
+    } else {
+        "LOSS"
+    }
+}
+
+fn should_manage_claims(config: &Config) -> bool {
+    config.enable_live_trading && config.on_chain_auto_claim_enabled
+}
+
+fn claim_status_from_record(record: &TradeRecord) -> ClaimStatus {
+    if let Some(status) = record.claim_status {
+        return status;
+    }
+
+    if record.claim_tx_hash.is_some() {
+        ClaimStatus::Success
+    } else {
+        ClaimStatus::Pending
+    }
+}
+
+fn to_pending_claim(record: &TradeRecord) -> Option<PendingClaim> {
+    if record.market.condition_id.trim().is_empty() {
+        return None;
+    }
+
+    if record.market.yes_token_id.trim().is_empty() || record.market.no_token_id.trim().is_empty() {
+        return None;
+    }
+
+    if matches!(
+        claim_status_from_record(record),
+        ClaimStatus::Success | ClaimStatus::Failed
+    ) {
+        return None;
+    }
+
+    Some(PendingClaim {
+        trade_id: record.id.clone(),
+        window_slug: record.window.slug.clone(),
+        condition_id: record.market.condition_id.clone(),
+        yes_token_id: record.market.yes_token_id.clone(),
+        no_token_id: record.market.no_token_id.clone(),
+        created_at_ms: record.timestamp_ms,
+        poll_count: 0,
+        claim_attempts: record.claim_attempts.unwrap_or(0),
+        last_update_ms: now_ms(),
+        last_error: record.claim_last_error.clone(),
+    })
+}
+
+async fn restore_pending_claims_from_history(
+    config: &Config,
+    pending_claims: &mut HashMap<String, PendingClaim>,
+) -> Result<()> {
+    let records = read_trade_records(&config.trades_output_path).await?;
+    let mut restored = 0_u64;
+
+    for record in records {
+        let Some(pending) = to_pending_claim(&record) else {
+            continue;
+        };
+
+        if pending_claims.contains_key(&pending.trade_id) {
+            continue;
+        }
+
+        pending_claims.insert(pending.trade_id.clone(), pending);
+        restored += 1;
+    }
+
+    if restored > 0 {
+        log_info(
+            "Settlement",
+            &format!("restored {restored} pending claim(s) from history"),
+        );
+    }
+
+    Ok(())
+}
+
+async fn sweep_pending_claims(
+    config: &Config,
+    pending_claims: &mut HashMap<String, PendingClaim>,
+    telegram: &TelegramNotifier,
+) -> Result<()> {
+    if pending_claims.is_empty() {
+        return Ok(());
+    }
+
+    let entries: Vec<(String, PendingClaim)> = pending_claims
+        .iter()
+        .map(|(trade_id, pending)| (trade_id.clone(), pending.clone()))
+        .collect();
+    let checked_total = entries.len();
+
+    let mut settled = 0_u64;
+
+    for (trade_id, pending) in entries {
+        let next_poll_count = pending.poll_count + 1;
+
+        match process_pending_claim(
+            config,
+            &trade_id,
+            &pending.window_slug,
+            &pending.condition_id,
+        )
+        .await
+        {
+            Ok(claim_result) => {
+                if claim_result.completed {
+                    let next_claim_attempts = pending.claim_attempts + 1;
+                    pending_claims.remove(&trade_id);
+                    settled += 1;
+                    let tx_label = claim_result.tx_hash.as_deref().unwrap_or("n/a");
+
+                    let updated_at_ms = now_ms();
+                    let _ = update_trade_claim_status(
+                        &config.trades_output_path,
+                        &trade_id,
+                        ClaimStatusUpdate {
+                            claim_status: Some(ClaimStatus::Success),
+                            claim_attempts: Some(next_claim_attempts),
+                            claim_tx_hash: claim_result.tx_hash.clone(),
+                            claim_last_error: Some(String::new()),
+                            claim_updated_at_ms: Some(updated_at_ms),
+                            market_resolved: Some(true),
+                            market_resolution_source: claim_result.resolution_source,
+                            market_resolved_at_ms: claim_result.market_resolved_at_ms,
+                        },
+                    )
+                    .await;
+
+                    log_info(
+                        "Settlement",
+                        &format!("claim completed trade={} tx={}", trade_id, tx_label),
+                    );
+
+                    if telegram.enabled {
+                        let _ = telegram
+                            .send(&format!(
+                                "[POLYMARKET BOT CLAIM OK]\ntrade : {}\nwindow: {}\ntx    : {}",
+                                trade_id,
+                                pending.window_slug,
+                                tx_label
+                            ))
+                            .await;
+                    }
+
+                    continue;
+                }
+
+                let next_claim_attempts = if claim_result.market_resolved {
+                    pending.claim_attempts + 1
+                } else {
+                    pending.claim_attempts
+                };
+
+                let reached_failure_threshold = claim_result.market_resolved
+                    && next_claim_attempts >= config.settlement_max_attempts;
+
+                let next_status = if reached_failure_threshold {
+                    ClaimStatus::Failed
+                } else {
+                    ClaimStatus::Pending
+                };
+
+                let claim_error = claim_result.error.clone();
+                if reached_failure_threshold {
+                    pending_claims.remove(&trade_id);
+                } else {
+                    pending_claims.insert(
+                        trade_id.clone(),
+                        PendingClaim {
+                            trade_id: trade_id.clone(),
+                            window_slug: pending.window_slug.clone(),
+                            condition_id: pending.condition_id.clone(),
+                            yes_token_id: pending.yes_token_id.clone(),
+                            no_token_id: pending.no_token_id.clone(),
+                            created_at_ms: pending.created_at_ms,
+                            poll_count: next_poll_count,
+                            claim_attempts: next_claim_attempts,
+                            last_update_ms: now_ms(),
+                            last_error: claim_error.clone(),
+                        },
+                    );
+                }
+
+                let _ = update_trade_claim_status(
+                    &config.trades_output_path,
+                    &trade_id,
+                    ClaimStatusUpdate {
+                        claim_status: Some(next_status),
+                        claim_attempts: Some(next_claim_attempts),
+                        claim_tx_hash: None,
+                        claim_last_error: claim_error.clone(),
+                        claim_updated_at_ms: Some(now_ms()),
+                        market_resolved: Some(claim_result.market_resolved),
+                        market_resolution_source: claim_result.resolution_source,
+                        market_resolved_at_ms: claim_result.market_resolved_at_ms,
+                    },
+                )
+                .await;
+
+                if !claim_result.market_resolved {
+                    log_info(
+                        "Settlement",
+                        &format!(
+                            "claim pending trade={} unresolved poll={} source={} reason={}",
+                            trade_id,
+                            next_poll_count,
+                            match claim_result.resolution_source {
+                                Some(value) => format!("{:?}", value),
+                                None => "none".to_owned(),
+                            },
+                            clip_text(claim_error.as_deref().unwrap_or("unknown"), 220)
+                        ),
+                    );
+                } else {
+                    log_warn(
+                        "Settlement",
+                        &format!(
+                            "claim attempt failed trade={} attempt={} reason={}",
+                            trade_id,
+                            next_claim_attempts,
+                            claim_error.as_deref().unwrap_or("unknown")
+                        ),
+                    );
+                }
+
+                if reached_failure_threshold && pending.claim_attempts < config.settlement_max_attempts {
+                    if telegram.enabled {
+                        let _ = telegram
+                            .send(&format!(
+                                "[POLYMARKET BOT CLAIM FAIL]\ntrade : {}\nwindow: {}\nreason: {}",
+                                trade_id,
+                                pending.window_slug,
+                                clip_text(claim_error.as_deref().unwrap_or("unknown"), 220)
+                            ))
+                            .await;
+                    }
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                let next_claim_attempts = pending.claim_attempts + 1;
+                let next_status = if next_claim_attempts >= config.settlement_max_attempts {
+                    ClaimStatus::Failed
+                } else {
+                    ClaimStatus::Pending
+                };
+
+                if matches!(next_status, ClaimStatus::Failed) {
+                    pending_claims.remove(&trade_id);
+                } else {
+                    pending_claims.insert(
+                        trade_id.clone(),
+                        PendingClaim {
+                            trade_id: trade_id.clone(),
+                            window_slug: pending.window_slug.clone(),
+                            condition_id: pending.condition_id.clone(),
+                            yes_token_id: pending.yes_token_id.clone(),
+                            no_token_id: pending.no_token_id.clone(),
+                            created_at_ms: pending.created_at_ms,
+                            poll_count: next_poll_count,
+                            claim_attempts: next_claim_attempts,
+                            last_update_ms: now_ms(),
+                            last_error: Some(message.clone()),
+                        },
+                    );
+                }
+
+                let _ = update_trade_claim_status(
+                    &config.trades_output_path,
+                    &trade_id,
+                    ClaimStatusUpdate {
+                        claim_status: Some(next_status),
+                        claim_attempts: Some(next_claim_attempts),
+                        claim_tx_hash: None,
+                        claim_last_error: Some(message.clone()),
+                        claim_updated_at_ms: Some(now_ms()),
+                        market_resolved: None,
+                        market_resolution_source: None,
+                        market_resolved_at_ms: None,
+                    },
+                )
+                .await;
+
+                log_warn(
+                    "Settlement",
+                    &format!(
+                        "claim sweep error trade={} attempt={} error={}",
+                        trade_id,
+                        next_claim_attempts,
+                        message
+                    ),
+                );
+            }
+        }
+    }
+
+    log_info(
+        "Settlement",
+        &format!(
+            "claim sweep checked={} settled={} pending={}",
+            checked_total,
+            settled,
+            pending_claims.len()
+        ),
+    );
+
+    Ok(())
+}
+
 pub async fn run_orchestrator(config: Config) -> Result<()> {
     let mut processed_windows: HashSet<u64> = HashSet::new();
+    let mut pending_claims: HashMap<String, PendingClaim> = HashMap::new();
     let telegram = create_telegram_notifier(&config);
     let mut pause_notice_sent = false;
+
+    if should_manage_claims(&config) {
+        if let Err(error) = restore_pending_claims_from_history(&config, &mut pending_claims).await {
+            log_warn(
+                "Settlement",
+                &format!("failed to restore pending claims: {error}"),
+            );
+        }
+    }
 
     log_info(
         "Boot",
@@ -62,11 +428,30 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
             return Ok(());
         }
 
-        run_cycle(&config, &mut processed_windows, &telegram).await?;
+        run_cycle(&config, &mut processed_windows, &mut pending_claims, &telegram).await?;
+
+        if should_manage_claims(&config) {
+            if let Err(error) = sweep_pending_claims(&config, &mut pending_claims, &telegram).await {
+                log_warn(
+                    "Settlement",
+                    &format!("claim sweep ended with error: {error}"),
+                );
+            }
+        }
+
         return Ok(());
     }
 
     loop {
+        if should_manage_claims(&config) {
+            if let Err(error) = sweep_pending_claims(&config, &mut pending_claims, &telegram).await {
+                log_warn(
+                    "Settlement",
+                    &format!("claim sweep ended with error: {error}"),
+                );
+            }
+        }
+
         if telegram.is_paused() {
             if !pause_notice_sent {
                 pause_notice_sent = true;
@@ -82,7 +467,14 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
             log_info("BOT", "trading resumed");
         }
 
-        if let Err(error) = run_cycle(&config, &mut processed_windows, &telegram).await {
+        if let Err(error) = run_cycle(
+            &config,
+            &mut processed_windows,
+            &mut pending_claims,
+            &telegram,
+        )
+        .await
+        {
             log_warn("Cycle", &format!("cycle ended with error: {error}"));
         }
 
@@ -218,6 +610,7 @@ async fn select_side_candidate(config: &Config, market: &DiscoveredMarket) -> Op
 async fn run_cycle(
     config: &Config,
     processed_windows: &mut HashSet<u64>,
+    pending_claims: &mut HashMap<String, PendingClaim>,
     telegram: &TelegramNotifier,
 ) -> Result<()> {
     let window = build_window(None);
@@ -322,14 +715,7 @@ async fn run_cycle(
             "Entry",
             &format!(
                 "status={} order={} filled={:.6} spent=${:.4}",
-                match execution.status {
-                    crate::types::ExecutionStatus::Pending => "PENDING",
-                    crate::types::ExecutionStatus::Filled => "FILLED",
-                    crate::types::ExecutionStatus::Partial => "PARTIAL",
-                    crate::types::ExecutionStatus::Cancelled => "CANCELLED",
-                    crate::types::ExecutionStatus::Failed => "FAILED",
-                    crate::types::ExecutionStatus::Skipped => "SKIPPED",
-                },
+                execution_status_label(execution.status),
                 execution.order_id,
                 execution.filled_size,
                 execution.spent_usd,
@@ -342,17 +728,142 @@ async fn run_cycle(
                     "[POLYMARKET BOT ENTRY]\nmarket: {}\nside  : {}\nstatus: {}\norder : {}\nspent : ${:.4}\nfilled: {:.6}",
                     window.slug,
                     side_label(candidate.side),
-                    match execution.status {
-                        crate::types::ExecutionStatus::Pending => "PENDING",
-                        crate::types::ExecutionStatus::Filled => "FILLED",
-                        crate::types::ExecutionStatus::Partial => "PARTIAL",
-                        crate::types::ExecutionStatus::Cancelled => "CANCELLED",
-                        crate::types::ExecutionStatus::Failed => "FAILED",
-                        crate::types::ExecutionStatus::Skipped => "SKIPPED",
-                    },
+                    execution_status_label(execution.status),
                     execution.order_id,
                     execution.spent_usd,
                     execution.filled_size,
+                ))
+                .await;
+        }
+
+        let resolve_target_sec = window.close_time_sec.saturating_add(config.resolve_delay_sec);
+        if now_sec() < resolve_target_sec {
+            let wait_sec = resolve_target_sec.saturating_sub(now_sec());
+            log_info(
+                "Cycle",
+                &format!(
+                    "stage={:?} waiting {}s until settlement checkpoint",
+                    RuntimeStage::WaitResolve,
+                    wait_sec
+                ),
+            );
+            sleep_until(resolve_target_sec).await;
+        }
+
+        log_info(
+            "Settlement",
+            &format!("stage={:?} resolving window={}", RuntimeStage::Resolving, window.slug),
+        );
+
+        let settlement = match resolve_window_outcome(config, window.window_start_sec, &window.slug).await {
+            Ok(value) => value,
+            Err(error) => {
+                log_warn(
+                    "Settlement",
+                    &format!("failed settlement resolution for {}: {}", window.slug, error),
+                );
+                processed_windows.insert(window.window_start_sec);
+                return Ok(());
+            }
+        };
+
+        let pnl = compute_trade_pnl(candidate.side, &execution, settlement.outcome);
+        let won = matches!(pnl.outcome, crate::types::TradeResult::Win);
+
+        let claim_enabled = should_manage_claims(config);
+        let record_id = trade_id(window.window_start_sec);
+        let timestamp_ms = now_ms();
+
+        let trade_record = TradeRecord {
+            id: record_id.clone(),
+            timestamp_ms,
+            mode: config.mode().to_owned(),
+            window: window.clone(),
+            market: market.clone(),
+            side: candidate.side,
+            selected_ask_price: candidate.ask_price,
+            selected_bid_price: candidate.bid_price,
+            stake_usd: execution.spent_usd,
+            execution: execution.clone(),
+            settlement: settlement.clone(),
+            outcome: pnl.outcome,
+            redeemed_usd: pnl.redeemed_usd,
+            pnl_usd: pnl.pnl_usd,
+            claim_status: if claim_enabled {
+                Some(ClaimStatus::Pending)
+            } else {
+                None
+            },
+            claim_attempts: if claim_enabled { Some(0) } else { None },
+            claim_tx_hash: None,
+            claim_last_error: None,
+            claim_updated_at_ms: if claim_enabled { Some(timestamp_ms) } else { None },
+            market_resolved: if claim_enabled { Some(false) } else { None },
+            market_resolution_source: None,
+            market_resolved_at_ms: None,
+        };
+
+        if let Err(error) = log_trade_record(&config.trades_output_path, &trade_record).await {
+            log_warn(
+                "Storage",
+                &format!("failed to persist trade record on {}: {}", window.slug, error),
+            );
+        }
+
+        if claim_enabled {
+            pending_claims.insert(
+                record_id.clone(),
+                PendingClaim {
+                    trade_id: record_id.clone(),
+                    window_slug: window.slug.clone(),
+                    condition_id: market.condition_id.clone(),
+                    yes_token_id: market.yes_token_id.clone(),
+                    no_token_id: market.no_token_id.clone(),
+                    created_at_ms: timestamp_ms,
+                    poll_count: 0,
+                    claim_attempts: 0,
+                    last_update_ms: timestamp_ms,
+                    last_error: None,
+                },
+            );
+
+            if let Err(error) = sweep_pending_claims(config, pending_claims, telegram).await {
+                log_warn(
+                    "Settlement",
+                    &format!("claim sweep ended with error: {error}"),
+                );
+            }
+        }
+
+        let pnl_sign = if pnl.pnl_usd >= 0.0 { "+" } else { "" };
+        log_info(
+            "BOT",
+            &format!(
+                "{} {} {} | pnl={}${:.2} | source={:?}{}",
+                window.slug,
+                side_label(candidate.side),
+                trade_result_label(won),
+                pnl_sign,
+                pnl.pnl_usd,
+                settlement.source,
+                if claim_enabled {
+                    " | claim=pending"
+                } else {
+                    ""
+                }
+            ),
+        );
+
+        if telegram.enabled {
+            let _ = telegram
+                .send(&format!(
+                    "[POLYMARKET BOT TRADE {}]\nwindow  : {}\nside    : {}\nspent   : ${:.2}\npnl     : {}${:.2}",
+                    execution_status_label(execution.status),
+                    window.slug,
+                    side_label(candidate.side),
+                    execution.spent_usd,
+                    pnl_sign,
+                    pnl.pnl_usd,
                 ))
                 .await;
         }
@@ -361,14 +872,7 @@ async fn run_cycle(
             "Entry",
             &format!(
                 "not filled status={}{}",
-                match execution.status {
-                    crate::types::ExecutionStatus::Pending => "PENDING",
-                    crate::types::ExecutionStatus::Filled => "FILLED",
-                    crate::types::ExecutionStatus::Partial => "PARTIAL",
-                    crate::types::ExecutionStatus::Cancelled => "CANCELLED",
-                    crate::types::ExecutionStatus::Failed => "FAILED",
-                    crate::types::ExecutionStatus::Skipped => "SKIPPED",
-                },
+                execution_status_label(execution.status),
                 if reason.is_empty() {
                     String::new()
                 } else {
@@ -383,14 +887,7 @@ async fn run_cycle(
                     "[POLYMARKET BOT ENTRY]\nmarket: {}\nside  : {}\nstatus: {}{}",
                     window.slug,
                     side_label(candidate.side),
-                    match execution.status {
-                        crate::types::ExecutionStatus::Pending => "PENDING",
-                        crate::types::ExecutionStatus::Filled => "FILLED",
-                        crate::types::ExecutionStatus::Partial => "PARTIAL",
-                        crate::types::ExecutionStatus::Cancelled => "CANCELLED",
-                        crate::types::ExecutionStatus::Failed => "FAILED",
-                        crate::types::ExecutionStatus::Skipped => "SKIPPED",
-                    },
+                    execution_status_label(execution.status),
                     if reason.is_empty() {
                         String::new()
                     } else {

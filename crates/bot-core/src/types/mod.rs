@@ -270,6 +270,8 @@ pub struct Config {
     pub market_lookup_max_wait_ms: u64,
     pub order_retry_interval_ms: u64,
     pub order_max_attempts: u64,
+    pub status_poll_interval_ms: u64,
+    pub status_poll_grace_sec: u64,
     pub polymarket_clob_url: String,
     pub polymarket_gamma_url: String,
     pub binance_base_url: String,
