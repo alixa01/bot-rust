@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 
 use crate::data::orderbook::fetch_orderbook_snapshot;
 use crate::execution::client::{get_clob_client, ClobClient};
-use crate::types::{ExecutionResult, ExecutionStatus, V3Config};
+use crate::types::{ExecutionResult, ExecutionStatus, Config};
 use crate::utils::logger::{log_error, log_info, log_warn};
 use crate::utils::time::{now_sec, sleep_ms};
 
@@ -47,7 +47,7 @@ struct SpentComputationResult {
 }
 
 struct SubmitFokParams<'a> {
-    config: &'a V3Config,
+    config: &'a Config,
     client: &'a ClobClient,
     token_id: &'a str,
     stake_usd: f64,
@@ -57,7 +57,7 @@ struct SubmitFokParams<'a> {
 }
 
 struct SubmitLimitFallbackParams<'a> {
-    config: &'a V3Config,
+    config: &'a Config,
     client: &'a ClobClient,
     token_id: &'a str,
     requested_stake_usd: f64,
@@ -93,7 +93,7 @@ fn clamp_price(price: f64) -> f64 {
     price.max(0.01).min(0.99)
 }
 
-fn buy_band_reject_reason(price: f64, config: &V3Config) -> Option<&'static str> {
+fn buy_band_reject_reason(price: f64, config: &Config) -> Option<&'static str> {
     if !config.entry_price_gate_enabled {
         return None;
     }
@@ -109,7 +109,7 @@ fn buy_band_reject_reason(price: f64, config: &V3Config) -> Option<&'static str>
     None
 }
 
-fn fallback_limit_price(config: &V3Config) -> f64 {
+fn fallback_limit_price(config: &Config) -> f64 {
     const PREFERRED_FALLBACK_PRICE: f64 = 0.95;
 
     if !config.entry_price_gate_enabled {
@@ -286,7 +286,7 @@ fn compute_spent_usd(
     }
 }
 
-fn attach_fill_band_audit(result: ExecutionResult, config: &V3Config) -> ExecutionResult {
+fn attach_fill_band_audit(result: ExecutionResult, config: &Config) -> ExecutionResult {
     if !config.entry_price_gate_enabled {
         return result;
     }
@@ -328,7 +328,7 @@ fn attach_fill_band_audit(result: ExecutionResult, config: &V3Config) -> Executi
 }
 
 async fn poll_final_order_status(
-    config: &V3Config,
+    config: &Config,
     client: &ClobClient,
     order_id: &str,
     poll_until_sec: u64,
@@ -575,7 +575,7 @@ async fn submit_limit_fallback(
 
 fn stop_for_attempt_limit(
     diagnostics: &mut EntryDiagnostics,
-    config: &V3Config,
+    config: &Config,
     attempt: u64,
 ) -> ExecutionResult {
     diagnostics.last_attempt_status = Some("ATTEMPT_LIMIT_REACHED".to_owned());
@@ -595,7 +595,7 @@ fn stop_for_attempt_limit(
 }
 
 pub async fn execute_live_entry(
-    config: &V3Config,
+    config: &Config,
     token_id: &str,
     stake_usd: f64,
     close_time_sec: u64,

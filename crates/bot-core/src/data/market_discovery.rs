@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::types::{DiscoveredMarket, MarketSide, V3Config};
+use crate::types::{DiscoveredMarket, MarketSide, Config};
 
 #[derive(Debug, Clone)]
 pub struct GammaResolutionProbe {
@@ -167,7 +167,7 @@ fn normalize_discovered_market(event: &Value, fallback_slug: &str) -> Option<Dis
     None
 }
 
-async fn fetch_events_by_slug(config: &V3Config, slug: &str) -> Result<Vec<Value>> {
+async fn fetch_events_by_slug(config: &Config, slug: &str) -> Result<Vec<Value>> {
     let base = config.polymarket_gamma_url.trim_end_matches('/');
     let response = Client::new()
         .get(format!("{base}/events"))
@@ -188,7 +188,7 @@ async fn fetch_events_by_slug(config: &V3Config, slug: &str) -> Result<Vec<Value
     Ok(payload.as_array().cloned().unwrap_or_default())
 }
 
-pub async fn fetch_market_by_slug(config: &V3Config, slug: &str) -> Result<Option<DiscoveredMarket>> {
+pub async fn fetch_market_by_slug(config: &Config, slug: &str) -> Result<Option<DiscoveredMarket>> {
     let events = fetch_events_by_slug(config, slug).await?;
     for event in events {
         if let Some(normalized) = normalize_discovered_market(&event, slug) {
@@ -199,7 +199,7 @@ pub async fn fetch_market_by_slug(config: &V3Config, slug: &str) -> Result<Optio
     Ok(None)
 }
 
-pub async fn fallback_resolve_from_gamma(config: &V3Config, slug: &str) -> Result<Option<MarketSide>> {
+pub async fn fallback_resolve_from_gamma(config: &Config, slug: &str) -> Result<Option<MarketSide>> {
     let market = fetch_market_by_slug(config, slug).await?;
     let Some(market) = market else {
         return Ok(None);
@@ -255,7 +255,7 @@ fn derive_resolution_from_market(market: &Value) -> (bool, Option<f64>, Option<f
 }
 
 pub async fn probe_gamma_resolution_by_slug(
-    config: &V3Config,
+    config: &Config,
     slug: &str,
     condition_id: &str,
 ) -> Result<GammaResolutionProbe> {

@@ -251,7 +251,7 @@ pub struct SelectedSideSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct V3Config {
+pub struct Config {
     pub once: bool,
     pub debug: bool,
     pub heartbeat_interval_sec: u64,
@@ -313,7 +313,7 @@ pub struct V3Config {
     pub total_loss_trades: u64,
 }
 
-impl V3Config {
+impl Config {
     pub fn mode(&self) -> &'static str {
         if self.enable_live_trading {
             "LIVE"

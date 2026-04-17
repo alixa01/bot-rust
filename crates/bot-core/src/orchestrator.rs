@@ -7,7 +7,7 @@ use crate::data::market_discovery::fetch_market_by_slug;
 use crate::data::orderbook::fetch_orderbook_snapshot;
 use crate::execution::order_executor::execute_live_entry;
 use crate::notifications::telegram_notifier::{create_telegram_notifier, TelegramNotifier};
-use crate::types::{DiscoveredMarket, MarketSide, V3Config};
+use crate::types::{DiscoveredMarket, MarketSide, Config};
 use crate::utils::logger::{log_cycle_separator, log_info, log_warn};
 use crate::utils::time::{build_window, now_sec, sleep_ms, sleep_until};
 
@@ -31,7 +31,7 @@ struct SideCandidate {
     bid_price: f64,
 }
 
-pub async fn run_orchestrator(config: V3Config) -> Result<()> {
+pub async fn run_orchestrator(config: Config) -> Result<()> {
     let mut processed_windows: HashSet<u64> = HashSet::new();
     let telegram = create_telegram_notifier(&config);
     let mut pause_notice_sent = false;
@@ -106,7 +106,7 @@ fn side_label(side: MarketSide) -> &'static str {
     }
 }
 
-fn buy_band_reject_reason(config: &V3Config, price: f64) -> Option<&'static str> {
+fn buy_band_reject_reason(config: &Config, price: f64) -> Option<&'static str> {
     if !config.entry_price_gate_enabled {
         return None;
     }
@@ -123,7 +123,7 @@ fn buy_band_reject_reason(config: &V3Config, price: f64) -> Option<&'static str>
 }
 
 async fn lookup_market_until_deadline(
-    config: &V3Config,
+    config: &Config,
     slug: &str,
     close_time_sec: u64,
 ) -> Result<Option<DiscoveredMarket>> {
@@ -151,7 +151,7 @@ async fn lookup_market_until_deadline(
 }
 
 async fn fetch_side_candidate(
-    config: &V3Config,
+    config: &Config,
     side: MarketSide,
     token_id: &str,
 ) -> Option<SideCandidate> {
@@ -206,7 +206,7 @@ async fn fetch_side_candidate(
     }
 }
 
-async fn select_side_candidate(config: &V3Config, market: &DiscoveredMarket) -> Option<SideCandidate> {
+async fn select_side_candidate(config: &Config, market: &DiscoveredMarket) -> Option<SideCandidate> {
     let up = fetch_side_candidate(config, MarketSide::Up, &market.yes_token_id).await;
     if up.is_some() {
         return up;
@@ -216,7 +216,7 @@ async fn select_side_candidate(config: &V3Config, market: &DiscoveredMarket) -> 
 }
 
 async fn run_cycle(
-    config: &V3Config,
+    config: &Config,
     processed_windows: &mut HashSet<u64>,
     telegram: &TelegramNotifier,
 ) -> Result<()> {

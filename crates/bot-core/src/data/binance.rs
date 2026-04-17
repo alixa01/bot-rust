@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Result};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::types::V3Config;
+use crate::types::Config;
 use crate::utils::network::fetch_with_timeout;
 
 const DEFAULT_BINANCE_BASE_URLS: [&str; 5] = [
@@ -57,7 +57,7 @@ async fn fetch_from_any_binance(binance_base_url: &str, path: &str) -> Result<re
     Err(last_error.unwrap_or_else(|| anyhow!("all binance endpoints failed")))
 }
 
-pub async fn fetch_window_open_price(config: &V3Config, window_start_sec: u64) -> Result<f64> {
+pub async fn fetch_window_open_price(config: &Config, window_start_sec: u64) -> Result<f64> {
     let path = format!(
         "/klines?symbol=BTCUSDT&interval=1m&startTime={}&limit=1",
         window_start_sec.saturating_mul(1000)

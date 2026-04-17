@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::time::sleep;
 
-use crate::types::V3Config;
+use crate::types::Config;
 use crate::utils::logger::{log_info, log_warn};
 
 const TELEGRAM_SEND_TIMEOUT_MS: u64 = 10_000;
@@ -324,7 +324,7 @@ impl TelegramNotifier {
     }
 }
 
-pub fn create_telegram_notifier(config: &V3Config) -> TelegramNotifier {
+pub fn create_telegram_notifier(config: &Config) -> TelegramNotifier {
     let enabled = config.telegram_bot_token.is_some() && config.telegram_chat_id.is_some();
 
     TelegramNotifier {

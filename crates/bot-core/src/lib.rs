@@ -13,9 +13,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::config::load_v3_config;
+use crate::config::load_config;
 
 pub async fn run(root_dir: &Path, argv: &[String]) -> Result<()> {
-    let config = load_v3_config(argv, root_dir)?;
+    let config = load_config(argv, root_dir)?;
     orchestrator::run_orchestrator(config).await
 }

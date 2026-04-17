@@ -1,8 +1,8 @@
 use anyhow::{bail, Result};
 
-use crate::types::V3Config;
+use crate::types::Config;
 
-pub fn parse_polygon_rpc_endpoints(config: &V3Config) -> Vec<String> {
+pub fn parse_polygon_rpc_endpoints(config: &Config) -> Vec<String> {
     config
         .polygon_rpc_url
         .split(',')
@@ -11,7 +11,7 @@ pub fn parse_polygon_rpc_endpoints(config: &V3Config) -> Vec<String> {
         .collect()
 }
 
-pub fn get_primary_polygon_rpc(config: &V3Config) -> Result<String> {
+pub fn get_primary_polygon_rpc(config: &Config) -> Result<String> {
     let endpoints = parse_polygon_rpc_endpoints(config);
     if let Some(first) = endpoints.first() {
         Ok(first.clone())

@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 
 use crate::types::{
     ClaimProcessingResult, ExecutionResult, MarketResolutionSource, MarketSide, TradeResult,
-    V3Config,
+    Config,
 };
 
 static RESOLUTION_CACHE: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
@@ -48,7 +48,7 @@ pub fn compute_trade_pnl(
 }
 
 pub async fn process_pending_claim(
-    _config: &V3Config,
+    _config: &Config,
     _trade_id: &str,
     _window_slug: &str,
     _condition_id: &str,

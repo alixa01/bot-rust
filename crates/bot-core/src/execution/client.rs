@@ -13,7 +13,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::Sha256;
 
-use crate::types::{SignatureType, V3Config};
+use crate::types::{SignatureType, Config};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -714,7 +714,7 @@ fn value_to_u64(value: &Value) -> Option<u64> {
     }
 }
 
-pub fn create_clob_client(config: &V3Config) -> Result<ClobClient> {
+pub fn create_clob_client(config: &Config) -> Result<ClobClient> {
     if config.private_key.trim().is_empty() {
         bail!("private key is required for live trading client");
     }
@@ -762,6 +762,6 @@ pub fn create_clob_client(config: &V3Config) -> Result<ClobClient> {
     })
 }
 
-pub fn get_clob_client(config: &V3Config) -> Result<ClobClient> {
+pub fn get_clob_client(config: &Config) -> Result<ClobClient> {
     create_clob_client(config)
 }

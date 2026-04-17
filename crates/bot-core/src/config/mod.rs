@@ -3,7 +3,40 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use crate::types::{LivePriceSource, SettlementTxMode, SignatureType, V3Config};
+use crate::types::{LivePriceSource, SettlementTxMode, SignatureType, Config};
+
+fn legacy_prefixed_env_keys() -> Vec<String> {
+    let mut found: Vec<String> = env::vars_os()
+        .filter_map(|(key, _)| key.into_string().ok())
+        .filter(|key| {
+            let bytes = key.as_bytes();
+            bytes.len() > 3 && bytes[0] == b'V' && bytes[1] == b'3' && bytes[2] == b'_'
+        })
+        .collect();
+
+    found.sort();
+    found
+}
+
+fn ensure_no_legacy_prefixed_keys() -> Result<()> {
+    let found = legacy_prefixed_env_keys();
+
+    if found.is_empty() {
+        return Ok(());
+    }
+
+    let migration_hints = found
+        .iter()
+        .map(|key| format!("{key} -> {}", &key[3..]))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    bail!(
+        "Legacy env keys are no longer supported: {}. Rename them to unprefixed keys: {}",
+        found.join(", "),
+        migration_hints
+    )
+}
 
 fn optional_env(key: &str, fallback: &str) -> String {
     match env::var(key) {
@@ -133,36 +166,38 @@ fn normalize_optional_address(raw: &str) -> Result<Option<String>> {
     Ok(Some(trimmed.to_owned()))
 }
 
-pub fn load_v3_config(argv: &[String], root_dir: &Path) -> Result<V3Config> {
+pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
+    ensure_no_legacy_prefixed_keys()?;
+
     let once = if argv.iter().any(|arg| arg == "--once") {
         true
     } else {
-        boolean_env("V3_ONCE", false)?
+        boolean_env("ONCE", false)?
     };
-    let debug = boolean_env("V3_DEBUG", false)?;
+    let debug = boolean_env("DEBUG", false)?;
 
-    let heartbeat_interval_sec = floor_u64_env("V3_HEARTBEAT_INTERVAL_SECONDS", 15.0)?;
-    let silent_watchdog_sec = floor_u64_env("V3_SILENT_WATCHDOG_SECONDS", 60.0)?;
+    let heartbeat_interval_sec = floor_u64_env("HEARTBEAT_INTERVAL_SECONDS", 15.0)?;
+    let silent_watchdog_sec = floor_u64_env("SILENT_WATCHDOG_SECONDS", 60.0)?;
 
-    let enable_live_trading = boolean_env("V3_ENABLE_LIVE_TRADING", false)?;
-    let stake_usd = number_env("V3_STAKE_USD", 1.0)?;
+    let enable_live_trading = boolean_env("ENABLE_LIVE_TRADING", false)?;
+    let stake_usd = number_env("STAKE_USD", 1.0)?;
 
-    let price_range_min = number_env("V3_PRICE_RANGE_MIN", 0.75)?;
-    let price_range_max = number_env("V3_PRICE_RANGE_MAX", 0.95)?;
-    let entry_price_gate_enabled = boolean_env("V3_ENABLE_ENTRY_PRICE_GATE", true)?;
-    let entry_slippage_percent_buy = number_env("V3_ENTRY_SLIPPAGE_PERCENT_BUY", 1.5)?;
-    let enable_fallback_gtc_limit = boolean_env("V3_ENABLE_FALLBACK_GTC_LIMIT", false)?;
+    let price_range_min = number_env("PRICE_RANGE_MIN", 0.75)?;
+    let price_range_max = number_env("PRICE_RANGE_MAX", 0.95)?;
+    let entry_price_gate_enabled = boolean_env("ENABLE_ENTRY_PRICE_GATE", true)?;
+    let entry_slippage_percent_buy = number_env("ENTRY_SLIPPAGE_PERCENT_BUY", 1.5)?;
+    let enable_fallback_gtc_limit = boolean_env("ENABLE_FALLBACK_GTC_LIMIT", false)?;
 
-    let check_before_close_sec = floor_u64_env("V3_CHECK_BEFORE_CLOSE_SECONDS", 10.0)?;
-    let resolve_delay_sec = floor_u64_env("V3_RESOLVE_DELAY_SECONDS", 2.0)?;
-    let idle_poll_interval_ms = floor_u64_env("V3_IDLE_POLL_INTERVAL_MS", 1000.0)?;
-    let market_poll_interval_ms = floor_u64_env("V3_MARKET_POLL_INTERVAL_MS", 500.0)?;
-    let market_lookup_max_wait_ms = floor_u64_env("V3_MARKET_LOOKUP_MAX_WAIT_MS", 12000.0)?;
-    let order_retry_interval_ms = floor_u64_env("V3_ORDER_RETRY_INTERVAL_MS", 1000.0)?;
-    let order_max_attempts = floor_u64_env("V3_ORDER_MAX_ATTEMPTS", 4.0)?;
+    let check_before_close_sec = floor_u64_env("CHECK_BEFORE_CLOSE_SECONDS", 10.0)?;
+    let resolve_delay_sec = floor_u64_env("RESOLVE_DELAY_SECONDS", 2.0)?;
+    let idle_poll_interval_ms = floor_u64_env("IDLE_POLL_INTERVAL_MS", 1000.0)?;
+    let market_poll_interval_ms = floor_u64_env("MARKET_POLL_INTERVAL_MS", 500.0)?;
+    let market_lookup_max_wait_ms = floor_u64_env("MARKET_LOOKUP_MAX_WAIT_MS", 12000.0)?;
+    let order_retry_interval_ms = floor_u64_env("ORDER_RETRY_INTERVAL_MS", 1000.0)?;
+    let order_max_attempts = floor_u64_env("ORDER_MAX_ATTEMPTS", 4.0)?;
 
-    let loss_cooldown_minutes = floor_u64_env("V3_LOSS_COOLDOWN_MINUTES", 0.0)?;
-    let total_loss_trades = floor_u64_env("V3_TOTAL_LOSS_TRADES", 0.0)?;
+    let loss_cooldown_minutes = floor_u64_env("LOSS_COOLDOWN_MINUTES", 0.0)?;
+    let total_loss_trades = floor_u64_env("TOTAL_LOSS_TRADES", 0.0)?;
 
     let polymarket_clob_url = optional_env("POLYMARKET_CLOB_URL", "https://clob.polymarket.com");
     let polymarket_gamma_url = optional_env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com");
@@ -248,49 +283,49 @@ pub fn load_v3_config(argv: &[String], root_dir: &Path) -> Result<V3Config> {
     let ctf_contract = optional_env("CTF_CONTRACT", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
     let usdc_address = optional_env("USDC_E", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
-    let output_file = optional_env("V3_OUTPUT_FILE", "result.jsonl");
-    let trades_output_file = optional_env("V3_TRADES_OUTPUT_FILE", "trades.v3.jsonl");
+    let output_file = optional_env("OUTPUT_FILE", "result.jsonl");
+    let trades_output_file = optional_env("TRADES_OUTPUT_FILE", "trades.jsonl");
     let output_path = root_dir.join(output_file);
     let trades_output_path = root_dir.join(trades_output_file);
 
     if heartbeat_interval_sec == 0 {
-        bail!("V3_HEARTBEAT_INTERVAL_SECONDS must be > 0");
+        bail!("HEARTBEAT_INTERVAL_SECONDS must be > 0");
     }
     if silent_watchdog_sec == 0 {
-        bail!("V3_SILENT_WATCHDOG_SECONDS must be > 0");
+        bail!("SILENT_WATCHDOG_SECONDS must be > 0");
     }
     if stake_usd <= 0.0 {
-        bail!("V3_STAKE_USD must be > 0");
+        bail!("STAKE_USD must be > 0");
     }
     if !(0.0..1.0).contains(&price_range_min) {
-        bail!("V3_PRICE_RANGE_MIN must be between 0 and 1");
+        bail!("PRICE_RANGE_MIN must be between 0 and 1");
     }
     if !(0.0..1.0).contains(&price_range_max) {
-        bail!("V3_PRICE_RANGE_MAX must be between 0 and 1");
+        bail!("PRICE_RANGE_MAX must be between 0 and 1");
     }
     if price_range_min >= price_range_max {
-        bail!("V3_PRICE_RANGE_MIN must be < V3_PRICE_RANGE_MAX");
+        bail!("PRICE_RANGE_MIN must be < PRICE_RANGE_MAX");
     }
     if entry_slippage_percent_buy < 0.0 {
-        bail!("V3_ENTRY_SLIPPAGE_PERCENT_BUY must be >= 0");
+        bail!("ENTRY_SLIPPAGE_PERCENT_BUY must be >= 0");
     }
     if check_before_close_sec == 0 {
-        bail!("V3_CHECK_BEFORE_CLOSE_SECONDS must be > 0");
+        bail!("CHECK_BEFORE_CLOSE_SECONDS must be > 0");
     }
     if idle_poll_interval_ms == 0 {
-        bail!("V3_IDLE_POLL_INTERVAL_MS must be > 0");
+        bail!("IDLE_POLL_INTERVAL_MS must be > 0");
     }
     if market_poll_interval_ms == 0 {
-        bail!("V3_MARKET_POLL_INTERVAL_MS must be > 0");
+        bail!("MARKET_POLL_INTERVAL_MS must be > 0");
     }
     if market_lookup_max_wait_ms == 0 {
-        bail!("V3_MARKET_LOOKUP_MAX_WAIT_MS must be > 0");
+        bail!("MARKET_LOOKUP_MAX_WAIT_MS must be > 0");
     }
     if order_retry_interval_ms == 0 {
-        bail!("V3_ORDER_RETRY_INTERVAL_MS must be > 0");
+        bail!("ORDER_RETRY_INTERVAL_MS must be > 0");
     }
     if order_max_attempts == 0 {
-        bail!("V3_ORDER_MAX_ATTEMPTS must be > 0");
+        bail!("ORDER_MAX_ATTEMPTS must be > 0");
     }
     if live_price_max_staleness_ms == 0 {
         bail!("LIVE_PRICE_MAX_STALENESS_MS must be > 0");
@@ -324,24 +359,24 @@ pub fn load_v3_config(argv: &[String], root_dir: &Path) -> Result<V3Config> {
 
     if enable_live_trading {
         if private_key.is_empty() {
-            bail!("Missing PRIVATE_KEY/POLYMARKET_PRIVATE_KEY when V3_ENABLE_LIVE_TRADING=true");
+            bail!("Missing PRIVATE_KEY/POLYMARKET_PRIVATE_KEY when ENABLE_LIVE_TRADING=true");
         }
         if funder_address.is_empty() {
             bail!(
-                "Missing FUNDER_ADDRESS/POLYMARKET_FUNDER_ADDRESS/POLYMARKET_BALANCE_ADDRESS when V3_ENABLE_LIVE_TRADING=true"
+                "Missing FUNDER_ADDRESS/POLYMARKET_FUNDER_ADDRESS/POLYMARKET_BALANCE_ADDRESS when ENABLE_LIVE_TRADING=true"
             );
         }
         if !is_address(&funder_address) {
             bail!("FUNDER_ADDRESS must be a valid 0x address");
         }
         if api_key.trim().is_empty() {
-            bail!("POLYMARKET_API_KEY is required when V3_ENABLE_LIVE_TRADING=true");
+            bail!("POLYMARKET_API_KEY is required when ENABLE_LIVE_TRADING=true");
         }
         if api_secret.trim().is_empty() {
-            bail!("POLYMARKET_API_SECRET is required when V3_ENABLE_LIVE_TRADING=true");
+            bail!("POLYMARKET_API_SECRET is required when ENABLE_LIVE_TRADING=true");
         }
         if api_passphrase.trim().is_empty() {
-            bail!("POLYMARKET_API_PASSPHRASE is required when V3_ENABLE_LIVE_TRADING=true");
+            bail!("POLYMARKET_API_PASSPHRASE is required when ENABLE_LIVE_TRADING=true");
         }
     } else if !funder_address.is_empty() && !is_address(&funder_address) {
         bail!("FUNDER_ADDRESS must be a valid 0x address");
@@ -356,7 +391,7 @@ pub fn load_v3_config(argv: &[String], root_dir: &Path) -> Result<V3Config> {
         }
     }
 
-    Ok(V3Config {
+    Ok(Config {
         once,
         debug,
         heartbeat_interval_sec,

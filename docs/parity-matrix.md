@@ -1,13 +1,13 @@
-# Parity Matrix: BOT V3.0 -> BOT-RUST
+# Parity Matrix: TypeScript BOT -> BOT-RUST
 
 ## Runtime Boundary
 
-- Standalone target: BOT-RUST must run without runtime dependency to bot v2.0 or bot v3.0.
-- Reference source only: bot v3.0 for behavior mapping.
+- Standalone target: BOT-RUST must run without runtime dependency to sibling TypeScript bots.
+- Reference source only: TypeScript implementation for behavior mapping.
 
 ## Module Mapping
 
-| BOT V3.0 module                       | BOT-RUST module                                        | Status  |
+| TypeScript module                     | BOT-RUST module                                        | Status  |
 | ------------------------------------- | ------------------------------------------------------ | ------- |
 | src/config/index.ts                   | crates/bot-core/src/config/mod.rs                      | Started |
 | src/types/index.ts                    | crates/bot-core/src/types/mod.rs                       | Started |
@@ -32,7 +32,7 @@
 
 ## Next Implementation Targets
 
-1. Extend orchestrator to full BOT V3.0 stage parity (resolve/claim lifecycle, pause/guard handling).
+1. Extend orchestrator to full stage parity (resolve/claim lifecycle, pause/guard handling).
 2. Settlement redeem flow with relayer/direct fallback.
 3. Telegram lifecycle notification parity across all runtime stages.
 4. End-to-end runtime parity and lifecycle notifications.
