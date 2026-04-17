@@ -49,7 +49,6 @@ struct SpentComputationResult {
 #[derive(Debug, Clone)]
 enum PollStatusOutcome {
     Terminal(ExecutionResult),
-    StatusUnavailable,
     Timeout,
 }
 
@@ -407,11 +406,12 @@ async fn poll_final_order_status(
             log_warn(
                 "Entry",
                 &format!(
-                    "order={} get_order returned empty status; mark status unavailable",
+                    "order={} get_order returned empty status; treat as transient and continue polling",
                     order_id
                 ),
             );
-            return Ok(PollStatusOutcome::StatusUnavailable);
+            sleep_ms(STATUS_POLL_INTERVAL_MS).await;
+            continue;
         };
 
         let Some(status_record) = extract_status_record(&status_value) else {
@@ -419,13 +419,14 @@ async fn poll_final_order_status(
             log_warn(
                 "Entry",
                 &format!(
-                    "order={} get_order returned unsupported status payload shape={} payload={} ; mark status unavailable",
+                    "order={} get_order returned unsupported status payload shape={} payload={} ; treat as transient and continue polling",
                     order_id,
                     shape,
                     truncate_text(&status_value.to_string(), 220)
                 ),
             );
-            return Ok(PollStatusOutcome::StatusUnavailable);
+            sleep_ms(STATUS_POLL_INTERVAL_MS).await;
+            continue;
         };
 
         let raw_status = status_record
@@ -613,23 +614,6 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
         .await?
     {
         PollStatusOutcome::Terminal(polled) => Ok(Some(polled)),
-        PollStatusOutcome::StatusUnavailable => {
-            let mut raw = to_raw_map(post_result);
-            raw.insert(
-                "reason".to_owned(),
-                json!("order_submitted_status_unavailable"),
-            );
-
-            Ok(Some(ExecutionResult {
-                status: ExecutionStatus::Pending,
-                order_id,
-                filled_price: params.final_price,
-                filled_size: 0.0,
-                spent_usd: 0.0,
-                used_fallback_limit: false,
-                raw_response: raw,
-            }))
-        }
         PollStatusOutcome::Timeout => {
             let mut raw = to_raw_map(post_result);
             raw.insert("reason".to_owned(), json!("order_status_poll_timeout"));
@@ -712,23 +696,6 @@ async fn submit_limit_fallback(
         .await?
     {
         PollStatusOutcome::Terminal(polled) => Ok(Some(polled)),
-        PollStatusOutcome::StatusUnavailable => {
-            let mut raw = to_raw_map(post_result);
-            raw.insert(
-                "reason".to_owned(),
-                json!("order_submitted_status_unavailable"),
-            );
-
-            Ok(Some(ExecutionResult {
-                status: ExecutionStatus::Pending,
-                order_id,
-                filled_price: fallback_price,
-                filled_size: 0.0,
-                spent_usd: 0.0,
-                used_fallback_limit: true,
-                raw_response: raw,
-            }))
-        }
         PollStatusOutcome::Timeout => {
             let mut raw = to_raw_map(post_result);
             raw.insert("reason".to_owned(), json!("order_status_poll_timeout"));
@@ -1066,18 +1033,6 @@ pub async fn execute_live_entry(
                 if value.status == ExecutionStatus::Filled || value.status == ExecutionStatus::Partial {
                     return Ok(value);
                 }
-
-                if value.status == ExecutionStatus::Pending && !value.order_id.trim().is_empty() {
-                    diagnostics.last_attempt_status = Some("FOK_PENDING_WITH_ORDER_ID".to_owned());
-                    log_warn(
-                        "Entry",
-                        &format!(
-                            "attempt #{} FOK pending with order={} ; stop retries to avoid duplicate submit",
-                            attempt, value.order_id
-                        ),
-                    );
-                    return Ok(value);
-                }
             }
         } else if config.enable_fallback_gtc_limit {
             diagnostics.no_asks_count += 1;
@@ -1134,18 +1089,6 @@ pub async fn execute_live_entry(
 
             if let Some(value) = fallback {
                 if value.status == ExecutionStatus::Filled || value.status == ExecutionStatus::Partial {
-                    return Ok(value);
-                }
-
-                if value.status == ExecutionStatus::Pending && !value.order_id.trim().is_empty() {
-                    diagnostics.last_attempt_status = Some("GTC_PENDING_WITH_ORDER_ID".to_owned());
-                    log_warn(
-                        "Entry",
-                        &format!(
-                            "attempt #{} GTC pending with order={} ; stop retries to avoid duplicate submit",
-                            attempt, value.order_id
-                        ),
-                    );
                     return Ok(value);
                 }
             }
