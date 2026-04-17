@@ -1,0 +1,12 @@
+[package]
+name = "bot-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dev-dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+bot-core = { path = "../bot-core" }
