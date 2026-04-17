@@ -1,10 +1,12 @@
 use std::time::Duration;
+use std::str::FromStr;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use chrono::Utc;
 use ethers::signers::{LocalWallet, Signer};
+use ethers::types::{Address, U256};
 use ethers::types::transaction::eip712::TypedData;
 use ethers::utils::parse_units;
 use hmac::{Hmac, Mac};
@@ -317,26 +319,29 @@ impl ClobClient {
             bail!("invalid taker amount for signed order");
         }
 
-        let maker_amount = parse_units(decimal_to_string(params.raw_maker_amount, 8), 6)
+        let maker_amount_raw = parse_units(decimal_to_string(params.raw_maker_amount, 8), 6)
             .context("failed to encode maker amount to base units")?
             .to_string();
-        let taker_amount = parse_units(decimal_to_string(params.raw_taker_amount, 8), 6)
+        let taker_amount_raw = parse_units(decimal_to_string(params.raw_taker_amount, 8), 6)
             .context("failed to encode taker amount to base units")?
             .to_string();
+        let maker_amount = normalize_uint256_string("makerAmount", &maker_amount_raw)?;
+        let taker_amount = normalize_uint256_string("takerAmount", &taker_amount_raw)?;
 
-        let salt = generate_order_salt();
-        let maker = self.funder_address.clone();
-        let signer = self.signer_address.clone();
-        let taker = ZERO_ADDRESS.to_owned();
-        let fee_rate_bps = params.fee_rate_bps.to_string();
-        let expiration = params.expiration.to_string();
-        let nonce = params.nonce.to_string();
+        let salt = normalize_uint256_string("salt", &generate_order_salt())?;
+        let maker = normalize_address_string("maker", &self.funder_address)?;
+        let signer = normalize_address_string("signer", &self.signer_address)?;
+        let taker = normalize_address_string("taker", ZERO_ADDRESS)?;
+        let token_id = normalize_uint256_string("tokenId", params.token_id)?;
+        let fee_rate_bps = normalize_uint256_string("feeRateBps", &params.fee_rate_bps.to_string())?;
+        let expiration = normalize_uint256_string("expiration", &params.expiration.to_string())?;
+        let nonce = normalize_uint256_string("nonce", &params.nonce.to_string())?;
 
-        let verifying_contract = if params.neg_risk {
+        let verifying_contract = normalize_address_string("verifyingContract", if params.neg_risk {
             NEG_RISK_EXCHANGE_POLYGON
         } else {
             EXCHANGE_POLYGON
-        };
+        })?;
 
         let typed_data_value = json!({
             "types": {
@@ -373,7 +378,7 @@ impl ClobClient {
                 "maker": maker,
                 "signer": signer,
                 "taker": taker,
-                "tokenId": params.token_id,
+                "tokenId": token_id,
                 "makerAmount": maker_amount,
                 "takerAmount": taker_amount,
                 "expiration": expiration,
@@ -385,13 +390,31 @@ impl ClobClient {
         });
 
         let typed_data: TypedData = serde_json::from_value(typed_data_value)
-            .context("failed to build typed-data payload for order signature")?;
+            .with_context(|| {
+                format!(
+                    "failed to build typed-data payload for order signature (tokenId={}, maker={}, signer={}, side={}, signatureType={})",
+                    token_id,
+                    maker,
+                    signer,
+                    params.side.as_u8(),
+                    self.signature_type,
+                )
+            })?;
 
         let signature = self
             .wallet
             .sign_typed_data(&typed_data)
             .await
-            .context("failed to sign order typed-data")?
+            .with_context(|| {
+                format!(
+                    "failed to sign order typed-data (tokenId={}, maker={}, signer={}, side={}, signatureType={})",
+                    token_id,
+                    maker,
+                    signer,
+                    params.side.as_u8(),
+                    self.signature_type,
+                )
+            })?
             .to_string();
 
         Ok(SignedOrder {
@@ -399,7 +422,7 @@ impl ClobClient {
             maker,
             signer,
             taker,
-            token_id: params.token_id.to_owned(),
+            token_id,
             maker_amount,
             taker_amount,
             expiration,
@@ -642,6 +665,39 @@ fn normalize_tick_size_string(tick: f64) -> String {
     }
 }
 
+fn normalize_uint256_string(field_name: &str, raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{field_name} must not be empty");
+    }
+
+    let value = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        U256::from_str_radix(hex, 16)
+            .with_context(|| format!("{field_name} must be valid hex uint256, got: {trimmed}"))?
+    } else {
+        U256::from_dec_str(trimmed).with_context(|| {
+            format!("{field_name} must be valid decimal uint256, got: {trimmed}")
+        })?
+    };
+
+    Ok(value.to_string())
+}
+
+fn normalize_address_string(field_name: &str, raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{field_name} must not be empty");
+    }
+
+    let address = Address::from_str(trimmed)
+        .with_context(|| format!("{field_name} must be a valid 0x address, got: {trimmed}"))?;
+
+    Ok(format!("{:#x}", address))
+}
+
 fn generate_order_salt() -> String {
     let now_ms = Utc::now().timestamp_millis().max(0) as u128;
     let pid = std::process::id() as u128;
@@ -737,7 +793,7 @@ pub fn create_clob_client(config: &Config) -> Result<ClobClient> {
         .context("invalid private key format for LocalWallet")?
         .with_chain_id(CHAIN_ID_POLYGON);
 
-    let signer_address = wallet.address().to_string();
+    let signer_address = format!("{:#x}", wallet.address());
     let signature_type = match config.signature_type {
         SignatureType::Eoa => 0,
         SignatureType::Safe => 1,
@@ -753,7 +809,7 @@ pub fn create_clob_client(config: &Config) -> Result<ClobClient> {
         host: config.polymarket_clob_url.trim_end_matches('/').to_owned(),
         wallet,
         signer_address,
-        funder_address: config.funder_address.trim().to_owned(),
+        funder_address: normalize_address_string("FUNDER_ADDRESS", &config.funder_address)?,
         signature_type,
         api_key: config.api_key.trim().to_owned(),
         api_secret: config.api_secret.trim().to_owned(),
@@ -764,4 +820,38 @@ pub fn create_clob_client(config: &Config) -> Result<ClobClient> {
 
 pub fn get_clob_client(config: &Config) -> Result<ClobClient> {
     create_clob_client(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_uint256_decimal() {
+        let value = normalize_uint256_string("tokenId", "123456789").unwrap();
+        assert_eq!(value, "123456789");
+    }
+
+    #[test]
+    fn normalizes_uint256_hex() {
+        let value = normalize_uint256_string("tokenId", "0x10").unwrap();
+        assert_eq!(value, "16");
+    }
+
+    #[test]
+    fn rejects_invalid_uint256() {
+        let error = normalize_uint256_string("tokenId", "not-a-number").unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("tokenId must be valid"));
+    }
+
+    #[test]
+    fn normalizes_address() {
+        let value = normalize_address_string(
+            "maker",
+            "0x0000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        assert_eq!(value.to_lowercase(), "0x0000000000000000000000000000000000000001");
+    }
 }

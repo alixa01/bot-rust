@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use serde_json::{json, Map, Value};
 
 use crate::data::orderbook::fetch_orderbook_snapshot;
@@ -107,6 +107,14 @@ fn buy_band_reject_reason(price: f64, config: &Config) -> Option<&'static str> {
     }
 
     None
+}
+
+fn format_error_chain(error: &Error) -> String {
+    error
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 fn fallback_limit_price(config: &Config) -> f64 {
@@ -858,7 +866,11 @@ pub async fn execute_live_entry(
                     diagnostics.last_attempt_status = Some("FOK_SUBMIT_ERROR".to_owned());
                     log_warn(
                         "Entry",
-                        &format!("attempt #{} FOK submit failed: {}", attempt, error),
+                        &format!(
+                            "attempt #{} FOK submit failed: {}",
+                            attempt,
+                            format_error_chain(&error)
+                        ),
                     );
                     None
                 }
@@ -913,7 +925,11 @@ pub async fn execute_live_entry(
                     diagnostics.last_attempt_status = Some("GTC_SUBMIT_ERROR".to_owned());
                     log_warn(
                         "Entry",
-                        &format!("attempt #{} GTC fallback failed: {}", attempt, error),
+                        &format!(
+                            "attempt #{} GTC fallback failed: {}",
+                            attempt,
+                            format_error_chain(&error)
+                        ),
                     );
                     None
                 }
