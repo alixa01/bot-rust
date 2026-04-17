@@ -16,7 +16,10 @@ fn project_root() -> Result<PathBuf> {
 
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .without_time()
+        .init();
 }
 
 #[tokio::main]

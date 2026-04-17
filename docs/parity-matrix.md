@@ -14,8 +14,8 @@
 | src/data/binance.ts                   | crates/bot-core/src/data/binance.rs                    | Started |
 | src/data/marketDiscovery.ts           | crates/bot-core/src/data/market_discovery.rs           | Started |
 | src/data/orderbook.ts                 | crates/bot-core/src/data/orderbook.rs                  | Started |
-| src/execution/client.ts               | crates/bot-core/src/execution/client.rs                | TODO    |
-| src/execution/orderExecutor.ts        | crates/bot-core/src/execution/order_executor.rs        | TODO    |
+| src/execution/client.ts               | crates/bot-core/src/execution/client.rs                | Started |
+| src/execution/orderExecutor.ts        | crates/bot-core/src/execution/order_executor.rs        | Started |
 | src/settlement/resultResolver.ts      | crates/bot-core/src/settlement/result_resolver.rs      | TODO    |
 | src/settlement/settlementService.ts   | crates/bot-core/src/settlement/settlement_service.rs   | Started |
 | src/storage/resultLogger.ts           | crates/bot-core/src/storage/result_logger.rs           | Started |
@@ -32,7 +32,7 @@
 
 ## Next Implementation Targets
 
-1. CLOB auth/signing and order execution parity.
+1. Extend orchestrator to full BOT V3.0 stage parity (resolve/claim lifecycle, pause/guard handling).
 2. Settlement redeem flow with relayer/direct fallback.
-3. Telegram command polling.
-4. End-to-end orchestrator parity and lifecycle notifications.
+3. Telegram lifecycle notification parity across all runtime stages.
+4. End-to-end runtime parity and lifecycle notifications.

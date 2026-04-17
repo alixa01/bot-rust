@@ -1,8 +1,13 @@
-use chrono::Utc;
+use chrono::{FixedOffset, Utc};
 use tracing::{error, info, warn};
 
 fn now_tag() -> String {
-    Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string()
+    // Use WIB (UTC+7) for all bot log timestamps.
+    let wib = FixedOffset::east_opt(7 * 60 * 60).expect("valid fixed offset");
+    Utc::now()
+        .with_timezone(&wib)
+        .format("%Y-%m-%d %H:%M:%S WIB")
+        .to_string()
 }
 
 pub fn log_info(scope: &str, message: &str) {
