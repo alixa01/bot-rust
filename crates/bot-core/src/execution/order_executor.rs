@@ -46,6 +46,13 @@ struct SpentComputationResult {
     requested_stake_usd: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+enum PollStatusOutcome {
+    Terminal(ExecutionResult),
+    StatusUnavailable,
+    Timeout,
+}
+
 struct SubmitFokParams<'a> {
     config: &'a Config,
     client: &'a ClobClient,
@@ -140,6 +147,57 @@ fn status_label(status: ExecutionStatus) -> &'static str {
         ExecutionStatus::Failed => "FAILED",
         ExecutionStatus::Skipped => "SKIPPED",
     }
+}
+
+fn value_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn looks_like_order_status_record(record: &Map<String, Value>) -> bool {
+    record.contains_key("status")
+        || record.contains_key("size_matched")
+        || record.contains_key("price")
+}
+
+fn extract_status_record<'a>(payload: &'a Value) -> Option<&'a Map<String, Value>> {
+    if let Some(record) = payload.as_object() {
+        if looks_like_order_status_record(record) {
+            return Some(record);
+        }
+
+        if let Some(order) = record.get("order").and_then(Value::as_object) {
+            if looks_like_order_status_record(order) {
+                return Some(order);
+            }
+        }
+
+        if let Some(data) = record.get("data").and_then(Value::as_object) {
+            if looks_like_order_status_record(data) {
+                return Some(data);
+            }
+
+            if let Some(order) = data.get("order").and_then(Value::as_object) {
+                if looks_like_order_status_record(order) {
+                    return Some(order);
+                }
+            }
+        }
+    }
+
+    if let Some(items) = payload.as_array() {
+        if let Some(first) = items.first() {
+            return extract_status_record(first);
+        }
+    }
+
+    None
 }
 
 fn parse_f64(value: Option<&Value>) -> f64 {
@@ -342,29 +400,32 @@ async fn poll_final_order_status(
     poll_until_sec: u64,
     spent_context: SpentComputationContext,
     used_fallback_limit: bool,
-) -> Result<Option<ExecutionResult>> {
+) -> Result<PollStatusOutcome> {
     while now_sec() <= poll_until_sec {
         let status = client.get_order(order_id).await?;
         let Some(status_value) = status else {
             log_warn(
                 "Entry",
                 &format!(
-                    "order={} get_order returned empty status; treat as transient and retry via outer attempt loop",
+                    "order={} get_order returned empty status; mark status unavailable",
                     order_id
                 ),
             );
-            return Ok(None);
+            return Ok(PollStatusOutcome::StatusUnavailable);
         };
 
-        let Some(status_record) = status_value.as_object() else {
+        let Some(status_record) = extract_status_record(&status_value) else {
+            let shape = value_shape(&status_value);
             log_warn(
                 "Entry",
                 &format!(
-                    "order={} get_order returned non-object status; treat as transient and retry via outer attempt loop",
-                    order_id
+                    "order={} get_order returned unsupported status payload shape={} payload={} ; mark status unavailable",
+                    order_id,
+                    shape,
+                    truncate_text(&status_value.to_string(), 220)
                 ),
             );
-            return Ok(None);
+            return Ok(PollStatusOutcome::StatusUnavailable);
         };
 
         let raw_status = status_record
@@ -412,7 +473,7 @@ async fn poll_final_order_status(
         );
 
         if raw_status == "MATCHED" || raw_status == "FILLED" {
-            return Ok(Some(attach_fill_band_audit(
+            return Ok(PollStatusOutcome::Terminal(attach_fill_band_audit(
                 ExecutionResult {
                     status: ExecutionStatus::Filled,
                     order_id: order_id.to_owned(),
@@ -427,7 +488,7 @@ async fn poll_final_order_status(
         }
 
         if raw_status == "CANCELED" || raw_status == "CANCELLED" || raw_status == "REJECTED" {
-            return Ok(Some(attach_fill_band_audit(
+            return Ok(PollStatusOutcome::Terminal(attach_fill_band_audit(
                 ExecutionResult {
                     status: if filled_size > 0.0 {
                         ExecutionStatus::Partial
@@ -448,17 +509,65 @@ async fn poll_final_order_status(
         sleep_ms(STATUS_POLL_INTERVAL_MS).await;
     }
 
-    Ok(None)
+    Ok(PollStatusOutcome::Timeout)
+}
+
+fn string_field(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn extract_order_id_from_object(record: &Map<String, Value>) -> Option<String> {
+    string_field(record.get("orderID"))
+        .or_else(|| string_field(record.get("orderId")))
+        .or_else(|| string_field(record.get("order_id")))
+        .or_else(|| string_field(record.get("id")))
+        .or_else(|| {
+            record
+                .get("order")
+                .and_then(Value::as_object)
+                .and_then(extract_order_id_from_object)
+        })
+        .or_else(|| {
+            record
+                .get("data")
+                .and_then(Value::as_object)
+                .and_then(extract_order_id_from_object)
+        })
+}
+
+fn summarize_top_level_keys(value: &Value) -> String {
+    if let Some(record) = value.as_object() {
+        let mut keys: Vec<String> = record.keys().cloned().collect();
+        keys.sort();
+        return keys.join(",");
+    }
+
+    if value.is_array() {
+        return "<array>".to_owned();
+    }
+
+    format!("<{}>", value_shape(value))
 }
 
 fn extract_order_id(post_result: &Value) -> String {
-    post_result
-        .get("orderID")
-        .and_then(Value::as_str)
-        .or_else(|| post_result.get("id").and_then(Value::as_str))
-        .unwrap_or("")
-        .trim()
-        .to_owned()
+    if let Some(value) = post_result.as_str() {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+
+    if let Some(record) = post_result.as_object() {
+        if let Some(order_id) = extract_order_id_from_object(record) {
+            return order_id;
+        }
+    }
+
+    String::new()
 }
 
 async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionResult>> {
@@ -479,11 +588,18 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
 
     let order_id = extract_order_id(&post_result);
     if order_id.is_empty() {
+        log_warn(
+            "Entry",
+            &format!(
+                "FOK post_order returned without order id keys=[{}] payload={}",
+                summarize_top_level_keys(&post_result),
+                truncate_text(&post_result.to_string(), 240)
+            ),
+        );
         return Ok(None);
     }
 
-    if let Some(polled) =
-        poll_final_order_status(
+    match poll_final_order_status(
             params.config,
             params.client,
             &order_id,
@@ -496,18 +612,39 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
         )
         .await?
     {
-        return Ok(Some(polled));
-    }
+        PollStatusOutcome::Terminal(polled) => Ok(Some(polled)),
+        PollStatusOutcome::StatusUnavailable => {
+            let mut raw = to_raw_map(post_result);
+            raw.insert(
+                "reason".to_owned(),
+                json!("order_submitted_status_unavailable"),
+            );
 
-    Ok(Some(ExecutionResult {
-        status: ExecutionStatus::Pending,
-        order_id,
-        filled_price: params.final_price,
-        filled_size: 0.0,
-        spent_usd: 0.0,
-        used_fallback_limit: false,
-        raw_response: to_raw_map(post_result),
-    }))
+            Ok(Some(ExecutionResult {
+                status: ExecutionStatus::Pending,
+                order_id,
+                filled_price: params.final_price,
+                filled_size: 0.0,
+                spent_usd: 0.0,
+                used_fallback_limit: false,
+                raw_response: raw,
+            }))
+        }
+        PollStatusOutcome::Timeout => {
+            let mut raw = to_raw_map(post_result);
+            raw.insert("reason".to_owned(), json!("order_status_poll_timeout"));
+
+            Ok(Some(ExecutionResult {
+                status: ExecutionStatus::Pending,
+                order_id,
+                filled_price: params.final_price,
+                filled_size: 0.0,
+                spent_usd: 0.0,
+                used_fallback_limit: false,
+                raw_response: raw,
+            }))
+        }
+    }
 }
 
 async fn submit_limit_fallback(
@@ -550,11 +687,18 @@ async fn submit_limit_fallback(
 
     let order_id = extract_order_id(&post_result);
     if order_id.is_empty() {
+        log_warn(
+            "Entry",
+            &format!(
+                "GTC post_order returned without order id keys=[{}] payload={}",
+                summarize_top_level_keys(&post_result),
+                truncate_text(&post_result.to_string(), 240)
+            ),
+        );
         return Ok(None);
     }
 
-    if let Some(polled) =
-        poll_final_order_status(
+    match poll_final_order_status(
             params.config,
             params.client,
             &order_id,
@@ -567,18 +711,39 @@ async fn submit_limit_fallback(
         )
         .await?
     {
-        return Ok(Some(polled));
-    }
+        PollStatusOutcome::Terminal(polled) => Ok(Some(polled)),
+        PollStatusOutcome::StatusUnavailable => {
+            let mut raw = to_raw_map(post_result);
+            raw.insert(
+                "reason".to_owned(),
+                json!("order_submitted_status_unavailable"),
+            );
 
-    Ok(Some(ExecutionResult {
-        status: ExecutionStatus::Pending,
-        order_id,
-        filled_price: fallback_price,
-        filled_size: 0.0,
-        spent_usd: 0.0,
-        used_fallback_limit: true,
-        raw_response: to_raw_map(post_result),
-    }))
+            Ok(Some(ExecutionResult {
+                status: ExecutionStatus::Pending,
+                order_id,
+                filled_price: fallback_price,
+                filled_size: 0.0,
+                spent_usd: 0.0,
+                used_fallback_limit: true,
+                raw_response: raw,
+            }))
+        }
+        PollStatusOutcome::Timeout => {
+            let mut raw = to_raw_map(post_result);
+            raw.insert("reason".to_owned(), json!("order_status_poll_timeout"));
+
+            Ok(Some(ExecutionResult {
+                status: ExecutionStatus::Pending,
+                order_id,
+                filled_price: fallback_price,
+                filled_size: 0.0,
+                spent_usd: 0.0,
+                used_fallback_limit: true,
+                raw_response: raw,
+            }))
+        }
+    }
 }
 
 fn stop_for_attempt_limit(
@@ -901,6 +1066,18 @@ pub async fn execute_live_entry(
                 if value.status == ExecutionStatus::Filled || value.status == ExecutionStatus::Partial {
                     return Ok(value);
                 }
+
+                if value.status == ExecutionStatus::Pending && !value.order_id.trim().is_empty() {
+                    diagnostics.last_attempt_status = Some("FOK_PENDING_WITH_ORDER_ID".to_owned());
+                    log_warn(
+                        "Entry",
+                        &format!(
+                            "attempt #{} FOK pending with order={} ; stop retries to avoid duplicate submit",
+                            attempt, value.order_id
+                        ),
+                    );
+                    return Ok(value);
+                }
             }
         } else if config.enable_fallback_gtc_limit {
             diagnostics.no_asks_count += 1;
@@ -957,6 +1134,18 @@ pub async fn execute_live_entry(
 
             if let Some(value) = fallback {
                 if value.status == ExecutionStatus::Filled || value.status == ExecutionStatus::Partial {
+                    return Ok(value);
+                }
+
+                if value.status == ExecutionStatus::Pending && !value.order_id.trim().is_empty() {
+                    diagnostics.last_attempt_status = Some("GTC_PENDING_WITH_ORDER_ID".to_owned());
+                    log_warn(
+                        "Entry",
+                        &format!(
+                            "attempt #{} GTC pending with order={} ; stop retries to avoid duplicate submit",
+                            attempt, value.order_id
+                        ),
+                    );
                     return Ok(value);
                 }
             }
@@ -1025,6 +1214,7 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn rounds_tick_price_up() {
@@ -1062,5 +1252,44 @@ mod tests {
 
         assert!((spent.spent_usd - 0.35).abs() < 0.000001);
         assert_eq!(spent.spent_source, "requested_stake_market_buy_capped_partial");
+    }
+
+    #[test]
+    fn extracts_order_id_from_nested_data_payload() {
+        let payload = json!({
+            "success": true,
+            "data": {
+                "order": {
+                    "orderId": "0xabc123"
+                }
+            }
+        });
+
+        assert_eq!(extract_order_id(&payload), "0xabc123");
+    }
+
+    #[test]
+    fn extracts_order_id_from_plain_string_payload() {
+        let payload = json!("0xdef456");
+        assert_eq!(extract_order_id(&payload), "0xdef456");
+    }
+
+    #[test]
+    fn extracts_status_record_from_wrapped_array_payload() {
+        let payload = json!([
+            {
+                "data": {
+                    "order": {
+                        "status": "MATCHED",
+                        "size_matched": "10",
+                        "price": "0.42"
+                    }
+                }
+            }
+        ]);
+
+        let record = extract_status_record(&payload).expect("status record should be detected");
+        assert_eq!(record.get("status").and_then(Value::as_str), Some("MATCHED"));
+        assert_eq!(record.get("size_matched").and_then(Value::as_str), Some("10"));
     }
 }
