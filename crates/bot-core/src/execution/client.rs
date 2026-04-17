@@ -176,8 +176,19 @@ impl ClobClient {
             .await
             .with_context(|| format!("failed to fetch order status for {order_id}"))?;
 
-        if !response.status().is_success() {
-            return Ok(None);
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| String::new());
+
+            return Ok(Some(json!({
+                "source": "get_order_http_error",
+                "orderId": order_id,
+                "httpStatus": status.as_u16(),
+                "body": truncate_text(&body, 220),
+            })));
         }
 
         let payload: Value = response
@@ -758,6 +769,14 @@ fn value_to_f64(value: &Value) -> Option<f64> {
         Value::String(text) => text.trim().parse::<f64>().ok(),
         _ => None,
     }
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+
+    value.chars().take(max_chars).collect()
 }
 
 fn value_to_u64(value: &Value) -> Option<u64> {

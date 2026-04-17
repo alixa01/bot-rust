@@ -9,6 +9,9 @@ use crate::types::{ExecutionResult, ExecutionStatus, Config};
 use crate::utils::logger::{log_error, log_info, log_warn};
 use crate::utils::time::{now_sec, sleep_ms};
 
+const STATUS_POLL_WARN_BURST: u64 = 3;
+const STATUS_POLL_UNAVAILABLE_ABORT_COUNT: u64 = 8;
+
 #[derive(Debug, Clone)]
 struct EntryDiagnostics {
     time_budget_start_sec: u64,
@@ -47,7 +50,14 @@ struct SpentComputationResult {
 #[derive(Debug, Clone)]
 enum PollStatusOutcome {
     Terminal(ExecutionResult),
-    Timeout,
+    Timeout(PollTimeoutDiagnostics),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PollTimeoutDiagnostics {
+    empty_status_count: u64,
+    unsupported_payload_count: u64,
+    aborted_due_to_unavailable: bool,
 }
 
 struct SubmitFokParams<'a> {
@@ -402,31 +412,81 @@ async fn poll_final_order_status(
     spent_context: SpentComputationContext,
     used_fallback_limit: bool,
 ) -> Result<PollStatusOutcome> {
+    let mut empty_status_count = 0_u64;
+    let mut unsupported_payload_count = 0_u64;
+
     while now_sec() <= poll_until_sec {
         let status = client.get_order(order_id).await?;
         let Some(status_value) = status else {
-            log_warn(
-                "Entry",
-                &format!(
-                    "order={} get_order returned empty status; treat as transient and continue polling",
-                    order_id
-                ),
-            );
+            empty_status_count += 1;
+            if should_log_poll_warning(empty_status_count) {
+                log_warn(
+                    "Entry",
+                    &format!(
+                        "order={} get_order returned empty status (count={}); treat as transient and continue polling",
+                        order_id, empty_status_count
+                    ),
+                );
+            }
+
+            if empty_status_count + unsupported_payload_count >= STATUS_POLL_UNAVAILABLE_ABORT_COUNT {
+                log_warn(
+                    "Entry",
+                    &format!(
+                        "order={} stop polling due to repeated unavailable status responses (empty={}, unsupported={}, abortAt={})",
+                        order_id,
+                        empty_status_count,
+                        unsupported_payload_count,
+                        STATUS_POLL_UNAVAILABLE_ABORT_COUNT,
+                    ),
+                );
+
+                return Ok(PollStatusOutcome::Timeout(PollTimeoutDiagnostics {
+                    empty_status_count,
+                    unsupported_payload_count,
+                    aborted_due_to_unavailable: true,
+                }));
+            }
+
             sleep_ms(config.status_poll_interval_ms).await;
             continue;
         };
 
         let Some(status_record) = extract_status_record(&status_value) else {
             let shape = value_shape(&status_value);
-            log_warn(
-                "Entry",
-                &format!(
-                    "order={} get_order returned unsupported status payload shape={} payload={} ; treat as transient and continue polling",
-                    order_id,
-                    shape,
-                    truncate_text(&status_value.to_string(), 220)
-                ),
-            );
+            unsupported_payload_count += 1;
+            if should_log_poll_warning(unsupported_payload_count) {
+                log_warn(
+                    "Entry",
+                    &format!(
+                        "order={} get_order returned unsupported status payload shape={} payload={} (count={}); treat as transient and continue polling",
+                        order_id,
+                        shape,
+                        truncate_text(&status_value.to_string(), 220),
+                        unsupported_payload_count,
+                    ),
+                );
+            }
+
+            if empty_status_count + unsupported_payload_count >= STATUS_POLL_UNAVAILABLE_ABORT_COUNT {
+                log_warn(
+                    "Entry",
+                    &format!(
+                        "order={} stop polling due to repeated unavailable status responses (empty={}, unsupported={}, abortAt={})",
+                        order_id,
+                        empty_status_count,
+                        unsupported_payload_count,
+                        STATUS_POLL_UNAVAILABLE_ABORT_COUNT,
+                    ),
+                );
+
+                return Ok(PollStatusOutcome::Timeout(PollTimeoutDiagnostics {
+                    empty_status_count,
+                    unsupported_payload_count,
+                    aborted_due_to_unavailable: true,
+                }));
+            }
+
             sleep_ms(config.status_poll_interval_ms).await;
             continue;
         };
@@ -512,7 +572,11 @@ async fn poll_final_order_status(
         sleep_ms(config.status_poll_interval_ms).await;
     }
 
-    Ok(PollStatusOutcome::Timeout)
+    Ok(PollStatusOutcome::Timeout(PollTimeoutDiagnostics {
+        empty_status_count,
+        unsupported_payload_count,
+        aborted_due_to_unavailable: false,
+    }))
 }
 
 fn string_field(value: Option<&Value>) -> Option<String> {
@@ -523,11 +587,178 @@ fn string_field(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn bool_field(value: Option<&Value>) -> Option<bool> {
+    match value {
+        Some(Value::Bool(value)) => Some(*value),
+        Some(Value::String(value)) => {
+            let normalized = value.trim().to_lowercase();
+            match normalized.as_str() {
+                "true" | "1" => Some(true),
+                "false" | "0" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn object_string_field(record: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = string_field(record.get(*key)) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+fn extract_submit_success(post_result: &Value) -> Option<bool> {
+    let Some(record) = post_result.as_object() else {
+        return None;
+    };
+
+    bool_field(record.get("success")).or_else(|| {
+        record
+            .get("data")
+            .and_then(Value::as_object)
+            .and_then(|data| bool_field(data.get("success")))
+    })
+}
+
+fn extract_submit_status(post_result: &Value) -> Option<String> {
+    let Some(record) = post_result.as_object() else {
+        return None;
+    };
+
+    object_string_field(record, &["status"]).or_else(|| {
+        record
+            .get("data")
+            .and_then(Value::as_object)
+            .and_then(|data| object_string_field(data, &["status"]))
+    })
+}
+
+fn extract_submit_error_message(post_result: &Value) -> Option<String> {
+    let Some(record) = post_result.as_object() else {
+        return None;
+    };
+
+    object_string_field(
+        record,
+        &[
+            "errorMsg",
+            "error_message",
+            "errorMessage",
+            "error",
+            "message",
+            "reason",
+        ],
+    )
+    .or_else(|| {
+        record
+            .get("error")
+            .and_then(Value::as_object)
+            .and_then(|error_record| {
+                object_string_field(
+                    error_record,
+                    &["message", "errorMsg", "reason", "code"],
+                )
+            })
+    })
+    .or_else(|| {
+        record
+            .get("data")
+            .and_then(Value::as_object)
+            .and_then(|data| {
+                object_string_field(
+                    data,
+                    &[
+                        "errorMsg",
+                        "error_message",
+                        "errorMessage",
+                        "error",
+                        "message",
+                        "reason",
+                    ],
+                )
+            })
+    })
+}
+
+fn looks_like_order_hash(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.len() != 66 || !trimmed.starts_with("0x") {
+        return false;
+    }
+
+    trimmed.chars().skip(2).all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn has_submit_shape(record: &Map<String, Value>) -> bool {
+    record.contains_key("success")
+        || record.contains_key("status")
+        || record.contains_key("orderID")
+        || record.contains_key("orderId")
+        || record.contains_key("order_id")
+        || record.contains_key("transactionsHashes")
+        || record.contains_key("tradeIDs")
+}
+
+fn infer_submit_error_code(error_message: &str) -> Option<String> {
+    let upper = error_message.to_uppercase();
+    const KNOWN_CODES: [&str; 12] = [
+        "INVALID_ORDER_MIN_SIZE",
+        "INVALID_ORDER_MIN_TICK_SIZE",
+        "INVALID_ORDER_DUPLICATED",
+        "INVALID_ORDER_NOT_ENOUGH_BALANCE",
+        "INVALID_ORDER_EXPIRATION",
+        "INVALID_ORDER_ERROR",
+        "INVALID_POST_ONLY_ORDER_TYPE",
+        "INVALID_POST_ONLY_ORDER",
+        "FOK_ORDER_NOT_FILLED_ERROR",
+        "EXECUTION_ERROR",
+        "ORDER_DELAYED",
+        "MARKET_NOT_READY",
+    ];
+
+    for code in KNOWN_CODES {
+        if upper.contains(code) {
+            return Some(code.to_owned());
+        }
+    }
+
+    None
+}
+
+fn is_non_retryable_submit_error(error_code: Option<&str>) -> bool {
+    matches!(
+        error_code,
+        Some(
+            "INVALID_ORDER_MIN_SIZE"
+                | "INVALID_ORDER_MIN_TICK_SIZE"
+                | "INVALID_ORDER_NOT_ENOUGH_BALANCE"
+                | "INVALID_ORDER_EXPIRATION"
+                | "INVALID_POST_ONLY_ORDER_TYPE"
+                | "INVALID_POST_ONLY_ORDER"
+        )
+    )
+}
+
+fn should_log_poll_warning(count: u64) -> bool {
+    count <= STATUS_POLL_WARN_BURST || count % 5 == 0
+}
+
 fn extract_order_id_from_object(record: &Map<String, Value>) -> Option<String> {
     string_field(record.get("orderID"))
         .or_else(|| string_field(record.get("orderId")))
         .or_else(|| string_field(record.get("order_id")))
-        .or_else(|| string_field(record.get("id")))
+        .or_else(|| {
+            if !has_submit_shape(record) {
+                return None;
+            }
+
+            string_field(record.get("id")).filter(|value| looks_like_order_hash(value))
+        })
         .or_else(|| {
             record
                 .get("order")
@@ -589,6 +820,74 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
         .post_order(&signed_order, "FOK", false, None)
         .await?;
 
+    let submit_success = extract_submit_success(&post_result);
+    let submit_status = extract_submit_status(&post_result);
+    let submit_error_message = extract_submit_error_message(&post_result);
+    let submit_error_code = submit_error_message
+        .as_deref()
+        .and_then(infer_submit_error_code);
+    let submit_rejected = submit_success == Some(false) || submit_error_message.is_some();
+
+    if submit_rejected {
+        let order_id = extract_order_id(&post_result);
+        let non_retryable = is_non_retryable_submit_error(submit_error_code.as_deref());
+
+        log_warn(
+            "Entry",
+            &format!(
+                "FOK submit rejected order={} success={:?} status={} code={} message={}",
+                if order_id.is_empty() {
+                    "<empty>"
+                } else {
+                    order_id.as_str()
+                },
+                submit_success,
+                submit_status.as_deref().unwrap_or("<none>"),
+                submit_error_code.as_deref().unwrap_or("<none>"),
+                submit_error_message.as_deref().unwrap_or("<none>"),
+            ),
+        );
+
+        let mut raw = to_raw_map(post_result);
+        raw.insert("reason".to_owned(), json!("order_submit_rejected"));
+        raw.insert(
+            "submitSuccess".to_owned(),
+            submit_success.map(|value| json!(value)).unwrap_or(Value::Null),
+        );
+        raw.insert(
+            "submitStatus".to_owned(),
+            submit_status
+                .as_ref()
+                .map(|value| json!(value))
+                .unwrap_or(Value::Null),
+        );
+        raw.insert(
+            "submitErrorMsg".to_owned(),
+            submit_error_message
+                .as_ref()
+                .map(|value| json!(value))
+                .unwrap_or(Value::Null),
+        );
+        raw.insert(
+            "submitErrorCode".to_owned(),
+            submit_error_code
+                .as_ref()
+                .map(|value| json!(value))
+                .unwrap_or(Value::Null),
+        );
+        raw.insert("submitTerminalNoRetry".to_owned(), json!(non_retryable));
+
+        return Ok(Some(ExecutionResult {
+            status: ExecutionStatus::Failed,
+            order_id,
+            filled_price: params.final_price,
+            filled_size: 0.0,
+            spent_usd: 0.0,
+            used_fallback_limit: false,
+            raw_response: raw,
+        }));
+    }
+
     let order_id = extract_order_id(&post_result);
     if order_id.is_empty() {
         log_warn(
@@ -621,9 +920,16 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
         .await?
     {
         PollStatusOutcome::Terminal(polled) => Ok(Some(polled)),
-        PollStatusOutcome::Timeout => {
+        PollStatusOutcome::Timeout(diagnostics) => {
             let mut raw = to_raw_map(post_result);
-            raw.insert("reason".to_owned(), json!("order_status_poll_timeout"));
+            raw.insert(
+                "reason".to_owned(),
+                json!(if diagnostics.aborted_due_to_unavailable {
+                    "order_status_unavailable"
+                } else {
+                    "order_status_poll_timeout"
+                }),
+            );
             raw.insert(
                 "statusPollIntervalMs".to_owned(),
                 json!(params.config.status_poll_interval_ms),
@@ -631,6 +937,19 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
             raw.insert(
                 "statusPollGraceSec".to_owned(),
                 json!(params.config.status_poll_grace_sec),
+            );
+            raw.insert("statusPollEmptyCount".to_owned(), json!(diagnostics.empty_status_count));
+            raw.insert(
+                "statusPollUnsupportedCount".to_owned(),
+                json!(diagnostics.unsupported_payload_count),
+            );
+            raw.insert(
+                "statusPollAbortedUnavailable".to_owned(),
+                json!(diagnostics.aborted_due_to_unavailable),
+            );
+            raw.insert(
+                "statusPollAbortCount".to_owned(),
+                json!(STATUS_POLL_UNAVAILABLE_ABORT_COUNT),
             );
             raw.insert("statusPollUntilSec".to_owned(), json!(poll_until_sec));
 
@@ -717,9 +1036,16 @@ async fn submit_limit_fallback(
         .await?
     {
         PollStatusOutcome::Terminal(polled) => Ok(Some(polled)),
-        PollStatusOutcome::Timeout => {
+        PollStatusOutcome::Timeout(diagnostics) => {
             let mut raw = to_raw_map(post_result);
-            raw.insert("reason".to_owned(), json!("order_status_poll_timeout"));
+            raw.insert(
+                "reason".to_owned(),
+                json!(if diagnostics.aborted_due_to_unavailable {
+                    "order_status_unavailable"
+                } else {
+                    "order_status_poll_timeout"
+                }),
+            );
             raw.insert(
                 "statusPollIntervalMs".to_owned(),
                 json!(params.config.status_poll_interval_ms),
@@ -727,6 +1053,19 @@ async fn submit_limit_fallback(
             raw.insert(
                 "statusPollGraceSec".to_owned(),
                 json!(params.config.status_poll_grace_sec),
+            );
+            raw.insert("statusPollEmptyCount".to_owned(), json!(diagnostics.empty_status_count));
+            raw.insert(
+                "statusPollUnsupportedCount".to_owned(),
+                json!(diagnostics.unsupported_payload_count),
+            );
+            raw.insert(
+                "statusPollAbortedUnavailable".to_owned(),
+                json!(diagnostics.aborted_due_to_unavailable),
+            );
+            raw.insert(
+                "statusPollAbortCount".to_owned(),
+                json!(STATUS_POLL_UNAVAILABLE_ABORT_COUNT),
             );
             raw.insert("statusPollUntilSec".to_owned(), json!(poll_until_sec));
 
@@ -1060,7 +1399,35 @@ pub async fn execute_live_entry(
             }
 
             if let Some(value) = result {
+                let should_stop = value
+                    .raw_response
+                    .get("submitTerminalNoRetry")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
                 if value.status == ExecutionStatus::Filled || value.status == ExecutionStatus::Partial {
+                    return Ok(value);
+                }
+
+                if should_stop {
+                    diagnostics.last_attempt_status = Some("FOK_TERMINAL_NO_RETRY".to_owned());
+                    log_warn(
+                        "Entry",
+                        &format!(
+                            "attempt #{} stop retries due to terminal submit error reason={} code={}",
+                            attempt,
+                            value
+                                .raw_response
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .unwrap_or("<none>"),
+                            value
+                                .raw_response
+                                .get("submitErrorCode")
+                                .and_then(Value::as_str)
+                                .unwrap_or("<none>"),
+                        ),
+                    );
                     return Ok(value);
                 }
             }
@@ -1264,5 +1631,36 @@ mod tests {
         let record = extract_status_record(&payload).expect("status record should be detected");
         assert_eq!(record.get("status").and_then(Value::as_str), Some("MATCHED"));
         assert_eq!(record.get("size_matched").and_then(Value::as_str), Some("10"));
+    }
+
+    #[test]
+    fn detects_submit_error_and_code() {
+        let payload = json!({
+            "success": false,
+            "errorMsg": "INVALID_ORDER_MIN_SIZE: order too small"
+        });
+
+        assert_eq!(extract_submit_success(&payload), Some(false));
+        assert_eq!(
+            extract_submit_error_message(&payload),
+            Some("INVALID_ORDER_MIN_SIZE: order too small".to_owned())
+        );
+
+        let error_code = extract_submit_error_message(&payload)
+            .as_deref()
+            .and_then(infer_submit_error_code);
+        assert_eq!(error_code.as_deref(), Some("INVALID_ORDER_MIN_SIZE"));
+        assert!(is_non_retryable_submit_error(error_code.as_deref()));
+    }
+
+    #[test]
+    fn ignores_non_hash_generic_id_for_submit_payload() {
+        let payload = json!({
+            "success": false,
+            "id": "12345",
+            "errorMsg": "INVALID_ORDER_MIN_SIZE"
+        });
+
+        assert_eq!(extract_order_id(&payload), "");
     }
 }
