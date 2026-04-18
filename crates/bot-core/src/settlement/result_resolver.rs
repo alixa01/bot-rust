@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 
 use crate::data::binance::fetch_window_open_close;
 use crate::data::market_discovery::fallback_resolve_from_gamma;
-use crate::types::{SettlementOutcome, Config};
+use crate::types::{Config, SettlementOutcome};
 use crate::types::{MarketSide, SettlementSource};
 use crate::utils::logger::log_warn;
 
@@ -29,10 +29,7 @@ pub async fn resolve_window_outcome(
             });
         }
         Err(error) => {
-            log_warn(
-                "Settlement",
-                &format!("Binance resolution failed: {error}"),
-            );
+            log_warn("Settlement", &format!("Binance resolution failed: {error}"));
         }
     }
 

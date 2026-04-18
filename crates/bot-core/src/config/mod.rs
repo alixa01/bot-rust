@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use crate::types::{LivePriceSource, SettlementTxMode, SignatureType, Config};
+use crate::types::{Config, LivePriceSource, SettlementTxMode, SignatureType};
 
 fn legacy_prefixed_env_keys() -> Vec<String> {
     let mut found: Vec<String> = env::vars_os()
@@ -147,10 +147,7 @@ fn is_address(value: &str) -> bool {
         return false;
     }
 
-    trimmed
-        .chars()
-        .skip(2)
-        .all(|c| c.is_ascii_hexdigit())
+    trimmed.chars().skip(2).all(|c| c.is_ascii_hexdigit())
 }
 
 fn normalize_optional_address(raw: &str) -> Result<Option<String>> {
@@ -187,6 +184,8 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     let entry_price_gate_enabled = boolean_env("ENABLE_ENTRY_PRICE_GATE", true)?;
     let entry_slippage_percent_buy = number_env("ENTRY_SLIPPAGE_PERCENT_BUY", 1.5)?;
     let enable_fallback_gtc_limit = boolean_env("ENABLE_FALLBACK_GTC_LIMIT", false)?;
+    let enable_post_fill_sell_limit = boolean_env("ENABLE_POST_FILL_SELL_LIMIT", false)?;
+    let post_fill_sell_limit_price = number_env("POST_FILL_SELL_LIMIT_PRICE", 0.85)?;
 
     let check_before_close_sec = floor_u64_env("CHECK_BEFORE_CLOSE_SECONDS", 10.0)?;
     let resolve_delay_sec = floor_u64_env("RESOLVE_DELAY_SECONDS", 2.0)?;
@@ -202,17 +201,25 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     let total_loss_trades = floor_u64_env("TOTAL_LOSS_TRADES", 0.0)?;
 
     let polymarket_clob_url = optional_env("POLYMARKET_CLOB_URL", "https://clob.polymarket.com");
-    let polymarket_gamma_url = optional_env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com");
-    let binance_base_url = optional_env("BINANCE_BASE_URL", "https://data-api.binance.vision/api/v3");
+    let polymarket_gamma_url =
+        optional_env("POLYMARKET_GAMMA_URL", "https://gamma-api.polymarket.com");
+    let binance_base_url =
+        optional_env("BINANCE_BASE_URL", "https://data-api.binance.vision/api/v3");
 
     let live_price_source = live_price_source_env()?;
-    let chainlink_btc_usd_feed_address =
-        optional_env("CHAINLINK_BTC_USD_FEED_ADDRESS", "0xc907E116054Ad103354f2D350FD2514433D57F6f");
+    let chainlink_btc_usd_feed_address = optional_env(
+        "CHAINLINK_BTC_USD_FEED_ADDRESS",
+        "0xc907E116054Ad103354f2D350FD2514433D57F6f",
+    );
     let live_price_max_staleness_ms = floor_u64_env("LIVE_PRICE_MAX_STALENESS_MS", 300000.0)?;
 
     let private_key_raw = optional_any_env(&["PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY"], "");
     let funder_address_raw = optional_any_env(
-        &["FUNDER_ADDRESS", "POLYMARKET_FUNDER_ADDRESS", "POLYMARKET_BALANCE_ADDRESS"],
+        &[
+            "FUNDER_ADDRESS",
+            "POLYMARKET_FUNDER_ADDRESS",
+            "POLYMARKET_BALANCE_ADDRESS",
+        ],
         "",
     );
 
@@ -258,7 +265,8 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
         }
     };
 
-    let relayer_api_key_address = normalize_optional_address(&optional_env("RELAYER_API_KEY_ADDRESS", ""))?;
+    let relayer_api_key_address =
+        normalize_optional_address(&optional_env("RELAYER_API_KEY_ADDRESS", ""))?;
     let relayer_request_timeout_ms = floor_u64_env("RELAYER_REQUEST_TIMEOUT_MS", 30000.0)?;
     let relayer_poll_interval_ms = floor_u64_env("RELAYER_POLL_INTERVAL_MS", 2000.0)?;
     let relayer_max_polls = floor_u64_env("RELAYER_MAX_POLLS", 120.0)?;
@@ -268,9 +276,11 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     let settlement_retry_delay_ms = floor_u64_env("SETTLEMENT_RETRY_DELAY_MS", 5000.0)?;
     let enable_gamma_resolution_fallback = boolean_env("ENABLE_GAMMA_RESOLUTION_FALLBACK", true)?;
 
-    let redeem_gas_limit_multiplier = number_env_in_range("REDEEM_GAS_LIMIT_MULTIPLIER", 1.3, 1.0, 5.0)?;
+    let redeem_gas_limit_multiplier =
+        number_env_in_range("REDEEM_GAS_LIMIT_MULTIPLIER", 1.3, 1.0, 5.0)?;
     let redeem_min_gas_limit = floor_u64_env("REDEEM_MIN_GAS_LIMIT", 300000.0)?;
-    let redeem_max_fee_per_gas_gwei = number_env_in_range("REDEEM_MAX_FEE_PER_GAS_GWEI", 100.0, 0.0, 1000.0)?;
+    let redeem_max_fee_per_gas_gwei =
+        number_env_in_range("REDEEM_MAX_FEE_PER_GAS_GWEI", 100.0, 0.0, 1000.0)?;
     let redeem_max_priority_fee_per_gas_gwei =
         number_env_in_range("REDEEM_MAX_PRIORITY_FEE_PER_GAS_GWEI", 30.0, 0.0, 1000.0)?;
     let redeem_internal_max_attempts = floor_u64_env("REDEEM_INTERNAL_MAX_ATTEMPTS", 3.0)?;
@@ -278,8 +288,7 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
         floor_u64_env("REDEEM_INTERNAL_RETRY_BASE_DELAY_MS", 2000.0)?;
     let redeem_internal_retry_backoff_multiplier =
         number_env_in_range("REDEEM_INTERNAL_RETRY_BACKOFF_MULTIPLIER", 2.0, 1.0, 5.0)?;
-    let redeem_tx_confirm_timeout_ms =
-        floor_u64_env("REDEEM_TX_CONFIRM_TIMEOUT_MS", 120000.0)?;
+    let redeem_tx_confirm_timeout_ms = floor_u64_env("REDEEM_TX_CONFIRM_TIMEOUT_MS", 120000.0)?;
 
     let polygon_rpc_url = optional_env("POLYGON_RPC_URL", "https://polygon-rpc.com");
     let ctf_contract = optional_env("CTF_CONTRACT", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
@@ -310,6 +319,9 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     }
     if entry_slippage_percent_buy < 0.0 {
         bail!("ENTRY_SLIPPAGE_PERCENT_BUY must be >= 0");
+    }
+    if !(0.01..=0.99).contains(&post_fill_sell_limit_price) {
+        bail!("POST_FILL_SELL_LIMIT_PRICE must be between 0.01 and 0.99");
     }
     if check_before_close_sec == 0 {
         bail!("CHECK_BEFORE_CLOSE_SECONDS must be > 0");
@@ -351,9 +363,7 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
         bail!("REDEEM_MIN_GAS_LIMIT must be >= 21000");
     }
     if redeem_max_priority_fee_per_gas_gwei > redeem_max_fee_per_gas_gwei {
-        bail!(
-            "REDEEM_MAX_PRIORITY_FEE_PER_GAS_GWEI must be <= REDEEM_MAX_FEE_PER_GAS_GWEI"
-        );
+        bail!("REDEEM_MAX_PRIORITY_FEE_PER_GAS_GWEI must be <= REDEEM_MAX_FEE_PER_GAS_GWEI");
     }
     if relayer_max_polls == 0 {
         bail!("RELAYER_MAX_POLLS must be > 0");
@@ -408,6 +418,8 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
         entry_price_gate_enabled,
         entry_slippage_percent_buy,
         enable_fallback_gtc_limit,
+        enable_post_fill_sell_limit,
+        post_fill_sell_limit_price,
         check_before_close_sec,
         resolve_delay_sec,
         idle_poll_interval_ms,

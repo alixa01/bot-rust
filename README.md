@@ -45,6 +45,15 @@ bash scripts/bootstrap_env.sh
 
 2. Runtime uses bot-rust/.env only.
 
+## Key Environment Keys
+
+- `ENTRY_SLIPPAGE_PERCENT_BUY`:
+  Controls BUY worst-price escalation percent component. Runtime combines this with an aggressive fixed markup floor and caps by configured max-buy bound.
+- `ENABLE_POST_FILL_SELL_LIMIT`:
+  If `true`, bot immediately places a SELL limit order after BUY is `FILLED` or `PARTIAL`.
+- `POST_FILL_SELL_LIMIT_PRICE`:
+  Absolute SELL limit price used for post-fill exit placement. Valid range: `0.01` to `0.99`.
+
 ## Run
 
 ```bash

@@ -54,7 +54,9 @@ fn parse_telegram_command(text: Option<&str>) -> Option<String> {
         return None;
     }
 
-    raw.split_whitespace().next().map(|value| value.to_lowercase())
+    raw.split_whitespace()
+        .next()
+        .map(|value| value.to_lowercase())
 }
 
 #[derive(Clone)]
@@ -123,11 +125,7 @@ impl TelegramNotifier {
             let body = response.text().await.unwrap_or_default();
             log_warn(
                 "Telegram",
-                &format!(
-                    "send failed http={} body={}",
-                    status,
-                    clip(&body, 200)
-                ),
+                &format!("send failed http={} body={}", status, clip(&body, 200)),
             );
         }
 
@@ -248,7 +246,9 @@ impl TelegramNotifier {
 
                 if command.as_deref() == Some("/resume") {
                     if self.set_paused_state(false, "command", None) {
-                        let _ = self.send("[POLYMARKET BOT CONTROL]\nTrading resumed.").await;
+                        let _ = self
+                            .send("[POLYMARKET BOT CONTROL]\nTrading resumed.")
+                            .await;
                     } else {
                         let _ = self
                             .send("[POLYMARKET BOT CONTROL]\nTrading is already running.")

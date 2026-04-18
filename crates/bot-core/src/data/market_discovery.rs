@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::types::{DiscoveredMarket, MarketSide, Config};
+use crate::types::{Config, DiscoveredMarket, MarketSide};
 
 #[derive(Debug, Clone)]
 pub struct GammaResolutionProbe {
@@ -181,7 +181,10 @@ async fn fetch_events_by_slug(config: &Config, slug: &str) -> Result<Vec<Value>>
     }
 
     if !response.status().is_success() {
-        return Err(anyhow!("Gamma fetch failed with HTTP {}", response.status()));
+        return Err(anyhow!(
+            "Gamma fetch failed with HTTP {}",
+            response.status()
+        ));
     }
 
     let payload: Value = response.json().await?;
@@ -199,7 +202,10 @@ pub async fn fetch_market_by_slug(config: &Config, slug: &str) -> Result<Option<
     Ok(None)
 }
 
-pub async fn fallback_resolve_from_gamma(config: &Config, slug: &str) -> Result<Option<MarketSide>> {
+pub async fn fallback_resolve_from_gamma(
+    config: &Config,
+    slug: &str,
+) -> Result<Option<MarketSide>> {
     let market = fetch_market_by_slug(config, slug).await?;
     let Some(market) = market else {
         return Ok(None);
@@ -241,9 +247,8 @@ fn derive_resolution_from_market(market: &Value) -> (bool, Option<f64>, Option<f
     let closed_flag = parse_bool_like(market.get("closed"));
     let active_flag = parse_bool_like(market.get("active"));
 
-    let mut resolved = resolved_flag == Some(true)
-        || closed_flag == Some(true)
-        || active_flag == Some(false);
+    let mut resolved =
+        resolved_flag == Some(true) || closed_flag == Some(true) || active_flag == Some(false);
 
     if let (Some(yes), Some(no)) = (yes_payout, no_payout) {
         if (yes + no - 1.0).abs() <= 0.01 && (yes == 1.0 || no == 1.0) {

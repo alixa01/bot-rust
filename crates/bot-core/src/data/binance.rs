@@ -57,7 +57,12 @@ async fn fetch_from_any_binance(binance_base_url: &str, path: &str) -> Result<re
     Err(last_error.unwrap_or_else(|| anyhow!("all binance endpoints failed")))
 }
 
-fn parse_kline_price(rows: &Value, candle_index: usize, field_index: usize, field_name: &str) -> Result<f64> {
+fn parse_kline_price(
+    rows: &Value,
+    candle_index: usize,
+    field_index: usize,
+    field_name: &str,
+) -> Result<f64> {
     let row = rows
         .as_array()
         .and_then(|arr| arr.get(candle_index))

@@ -7,8 +7,7 @@ use once_cell::sync::Lazy;
 
 use crate::data::market_discovery::probe_gamma_resolution_by_slug;
 use crate::types::{
-    ClaimProcessingResult, ExecutionResult, MarketResolutionSource, MarketSide, TradeResult,
-    Config,
+    ClaimProcessingResult, Config, ExecutionResult, MarketResolutionSource, MarketSide, TradeResult,
 };
 
 const RESOLUTION_CACHE_TTL_MS: u64 = 10 * 60 * 1000;

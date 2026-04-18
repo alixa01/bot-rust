@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 
 use crate::data::orderbook::fetch_orderbook_snapshot;
 use crate::execution::client::{get_clob_client, ClobClient};
-use crate::types::{ExecutionResult, ExecutionStatus, Config};
+use crate::types::{Config, ExecutionResult, ExecutionStatus};
 use crate::utils::logger::{log_error, log_info, log_warn};
 use crate::utils::time::{now_sec, sleep_ms};
 
@@ -60,6 +60,13 @@ struct PollTimeoutDiagnostics {
     aborted_due_to_unavailable: bool,
 }
 
+#[derive(Debug, Clone)]
+struct ClassifiedSubmitError {
+    message: String,
+    code: String,
+    retryable: bool,
+}
+
 struct SubmitFokParams<'a> {
     config: &'a Config,
     client: &'a ClobClient,
@@ -95,8 +102,14 @@ fn round_to_tick_ceil(price: f64, tick_size: &str) -> f64 {
     (rounded * factor).round() / factor
 }
 
-fn apply_buy_slippage(base_price: f64, slippage_percent: f64) -> f64 {
-    (base_price * (1.0 + (slippage_percent / 100.0))).min(0.99)
+fn apply_buy_slippage(base_price: f64, slippage_percent: f64, max_price: f64) -> f64 {
+    const FIXED_MARKUP: f64 = 0.17;
+
+    let percent_candidate = base_price * (1.0 + ((slippage_percent * 1.5) / 100.0));
+    let fixed_candidate = base_price + FIXED_MARKUP;
+    let slipped = percent_candidate.max(fixed_candidate);
+
+    slipped.min(max_price)
 }
 
 fn clamp_price(price: f64) -> f64 {
@@ -133,6 +146,84 @@ fn format_error_chain(error: &Error) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(" -> ")
+}
+
+fn compact_error_message(message: &str, max_chars: usize) -> String {
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    truncate_text(&collapsed, max_chars)
+}
+
+fn classify_submit_error_message(message: &str) -> ClassifiedSubmitError {
+    let compact = compact_error_message(message, 260);
+    let lower = compact.to_lowercase();
+
+    let retryable_hints = [
+        "timeout",
+        "timed out",
+        "network",
+        "socket",
+        "econnreset",
+        "enotfound",
+        "eai_again",
+        "temporarily unavailable",
+        "service unavailable",
+        "rate limit",
+        "too many requests",
+        "429",
+    ];
+
+    let non_retryable_hints = [
+        "unauthorized",
+        "forbidden",
+        "signature",
+        "invalid api",
+        "api key",
+        "passphrase",
+        "insufficient",
+        "not enough balance",
+        "invalid order",
+        "min size",
+        "min_order_size",
+    ];
+
+    if retryable_hints.iter().any(|hint| lower.contains(hint)) {
+        return ClassifiedSubmitError {
+            message: compact,
+            code: "RETRYABLE_NETWORK".to_owned(),
+            retryable: true,
+        };
+    }
+
+    if (500_u16..=599_u16).any(|code| lower.contains(&code.to_string())) {
+        return ClassifiedSubmitError {
+            message: compact,
+            code: "RETRYABLE_HTTP_5XX".to_owned(),
+            retryable: true,
+        };
+    }
+
+    if non_retryable_hints.iter().any(|hint| lower.contains(hint)) {
+        return ClassifiedSubmitError {
+            message: compact,
+            code: "NON_RETRYABLE_REQUEST".to_owned(),
+            retryable: false,
+        };
+    }
+
+    if lower.contains("400") || lower.contains("401") || lower.contains("403") {
+        return ClassifiedSubmitError {
+            message: compact,
+            code: "NON_RETRYABLE_HTTP_4XX".to_owned(),
+            retryable: false,
+        };
+    }
+
+    ClassifiedSubmitError {
+        message: compact,
+        code: "UNKNOWN_SUBMIT_ERROR".to_owned(),
+        retryable: false,
+    }
 }
 
 fn fallback_limit_price(config: &Config) -> f64 {
@@ -390,10 +481,7 @@ fn attach_fill_band_audit(result: ExecutionResult, config: &Config) -> Execution
 
     let mut raw = result.raw_response.clone();
     raw.insert("fillBandViolation".to_owned(), json!(true));
-    raw.insert(
-        "fillBandViolationReason".to_owned(),
-        json!(violation),
-    );
+    raw.insert("fillBandViolationReason".to_owned(), json!(violation));
     raw.insert(
         "fillBandObservedPrice".to_owned(),
         json!(result.filled_price),
@@ -401,7 +489,10 @@ fn attach_fill_band_audit(result: ExecutionResult, config: &Config) -> Execution
     raw.insert("fillBandMin".to_owned(), json!(config.price_range_min));
     raw.insert("fillBandMax".to_owned(), json!(config.price_range_max));
 
-    ExecutionResult { raw_response: raw, ..result }
+    ExecutionResult {
+        raw_response: raw,
+        ..result
+    }
 }
 
 async fn poll_final_order_status(
@@ -429,7 +520,8 @@ async fn poll_final_order_status(
                 );
             }
 
-            if empty_status_count + unsupported_payload_count >= STATUS_POLL_UNAVAILABLE_ABORT_COUNT {
+            if empty_status_count + unsupported_payload_count >= STATUS_POLL_UNAVAILABLE_ABORT_COUNT
+            {
                 log_warn(
                     "Entry",
                     &format!(
@@ -468,7 +560,8 @@ async fn poll_final_order_status(
                 );
             }
 
-            if empty_status_count + unsupported_payload_count >= STATUS_POLL_UNAVAILABLE_ABORT_COUNT {
+            if empty_status_count + unsupported_payload_count >= STATUS_POLL_UNAVAILABLE_ABORT_COUNT
+            {
                 log_warn(
                     "Entry",
                     &format!(
@@ -659,10 +752,7 @@ fn extract_submit_error_message(post_result: &Value) -> Option<String> {
             .get("error")
             .and_then(Value::as_object)
             .and_then(|error_record| {
-                object_string_field(
-                    error_record,
-                    &["message", "errorMsg", "reason", "code"],
-                )
+                object_string_field(error_record, &["message", "errorMsg", "reason", "code"])
             })
     })
     .or_else(|| {
@@ -852,7 +942,9 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
         raw.insert("reason".to_owned(), json!("order_submit_rejected"));
         raw.insert(
             "submitSuccess".to_owned(),
-            submit_success.map(|value| json!(value)).unwrap_or(Value::Null),
+            submit_success
+                .map(|value| json!(value))
+                .unwrap_or(Value::Null),
         );
         raw.insert(
             "submitStatus".to_owned(),
@@ -901,23 +993,21 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
         return Ok(None);
     }
 
-    let poll_until_sec = status_poll_deadline_sec(
-        params.close_time_sec,
-        params.config.status_poll_grace_sec,
-    );
+    let poll_until_sec =
+        status_poll_deadline_sec(params.close_time_sec, params.config.status_poll_grace_sec);
 
     match poll_final_order_status(
-            params.config,
-            params.client,
-            &order_id,
-            poll_until_sec,
-            SpentComputationContext {
-                mode: SpentComputationMode::MarketBuyRequestedStake,
-                requested_stake_usd: Some(params.stake_usd),
-            },
-            false,
-        )
-        .await?
+        params.config,
+        params.client,
+        &order_id,
+        poll_until_sec,
+        SpentComputationContext {
+            mode: SpentComputationMode::MarketBuyRequestedStake,
+            requested_stake_usd: Some(params.stake_usd),
+        },
+        false,
+    )
+    .await?
     {
         PollStatusOutcome::Terminal(polled) => Ok(Some(polled)),
         PollStatusOutcome::Timeout(diagnostics) => {
@@ -938,7 +1028,10 @@ async fn submit_fok_buy(params: SubmitFokParams<'_>) -> Result<Option<ExecutionR
                 "statusPollGraceSec".to_owned(),
                 json!(params.config.status_poll_grace_sec),
             );
-            raw.insert("statusPollEmptyCount".to_owned(), json!(diagnostics.empty_status_count));
+            raw.insert(
+                "statusPollEmptyCount".to_owned(),
+                json!(diagnostics.empty_status_count),
+            );
             raw.insert(
                 "statusPollUnsupportedCount".to_owned(),
                 json!(diagnostics.unsupported_payload_count),
@@ -1017,23 +1110,21 @@ async fn submit_limit_fallback(
         return Ok(None);
     }
 
-    let poll_until_sec = status_poll_deadline_sec(
-        params.close_time_sec,
-        params.config.status_poll_grace_sec,
-    );
+    let poll_until_sec =
+        status_poll_deadline_sec(params.close_time_sec, params.config.status_poll_grace_sec);
 
     match poll_final_order_status(
-            params.config,
-            params.client,
-            &order_id,
-            poll_until_sec,
-            SpentComputationContext {
-                mode: SpentComputationMode::FillSizeXPrice,
-                requested_stake_usd: None,
-            },
-            true,
-        )
-        .await?
+        params.config,
+        params.client,
+        &order_id,
+        poll_until_sec,
+        SpentComputationContext {
+            mode: SpentComputationMode::FillSizeXPrice,
+            requested_stake_usd: None,
+        },
+        true,
+    )
+    .await?
     {
         PollStatusOutcome::Terminal(polled) => Ok(Some(polled)),
         PollStatusOutcome::Timeout(diagnostics) => {
@@ -1054,7 +1145,10 @@ async fn submit_limit_fallback(
                 "statusPollGraceSec".to_owned(),
                 json!(params.config.status_poll_grace_sec),
             );
-            raw.insert("statusPollEmptyCount".to_owned(), json!(diagnostics.empty_status_count));
+            raw.insert(
+                "statusPollEmptyCount".to_owned(),
+                json!(diagnostics.empty_status_count),
+            );
             raw.insert(
                 "statusPollUnsupportedCount".to_owned(),
                 json!(diagnostics.unsupported_payload_count),
@@ -1082,6 +1176,279 @@ async fn submit_limit_fallback(
     }
 }
 
+fn round_size_to_6_decimals(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+
+    let factor = 1_000_000.0;
+    (value * factor).round() / factor
+}
+
+fn build_post_fill_sell_limit_payload(
+    token_id: &str,
+    requested_price: f64,
+    size: f64,
+) -> Map<String, Value> {
+    let mut payload = Map::new();
+    payload.insert("enabled".to_owned(), json!(true));
+    payload.insert("attempted".to_owned(), json!(false));
+    payload.insert("orderType".to_owned(), json!("GTC"));
+    payload.insert("tokenId".to_owned(), json!(token_id));
+    payload.insert("requestedPrice".to_owned(), json!(requested_price));
+    payload.insert("finalPrice".to_owned(), Value::Null);
+    payload.insert("tickSize".to_owned(), Value::Null);
+    payload.insert("size".to_owned(), json!(size));
+    payload.insert("success".to_owned(), json!(false));
+    payload.insert("orderId".to_owned(), Value::Null);
+    payload.insert("status".to_owned(), Value::Null);
+    payload.insert("errorMsg".to_owned(), Value::Null);
+    payload.insert("errorCode".to_owned(), Value::Null);
+    payload.insert("retryable".to_owned(), Value::Null);
+    payload.insert("errorPhase".to_owned(), Value::Null);
+
+    payload
+}
+
+async fn submit_post_fill_sell_limit(
+    config: &Config,
+    client: &ClobClient,
+    token_id: &str,
+    size: f64,
+) -> Map<String, Value> {
+    let requested_price = config.post_fill_sell_limit_price;
+    let normalized_size = round_size_to_6_decimals(size);
+    let mut payload =
+        build_post_fill_sell_limit_payload(token_id, requested_price, normalized_size);
+
+    if normalized_size <= 0.0 {
+        payload.insert("status".to_owned(), json!("skipped_no_filled_size"));
+        payload.insert(
+            "errorMsg".to_owned(),
+            json!("filled size must be > 0 to place post-fill sell limit"),
+        );
+        payload.insert("errorCode".to_owned(), json!("SELL_SIZE_INVALID"));
+        payload.insert("retryable".to_owned(), json!(false));
+        return payload;
+    }
+
+    let tick_size = match client.get_tick_size(token_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            let message = compact_error_message(&format_error_chain(&error), 180);
+            log_warn(
+                "Exit",
+                &format!(
+                    "post-fill SELL tick size fetch failed, fallback to 0.01: {}",
+                    message
+                ),
+            );
+            "0.01".to_owned()
+        }
+    };
+
+    payload.insert("tickSize".to_owned(), json!(tick_size.clone()));
+
+    let final_price = clamp_price(round_to_tick_ceil(clamp_price(requested_price), &tick_size));
+    payload.insert("finalPrice".to_owned(), json!(final_price));
+
+    let signed_order = match client
+        .create_limit_order_sell(token_id, normalized_size, final_price, &tick_size)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let classified = classify_submit_error_message(&format_error_chain(&error));
+            payload.insert("attempted".to_owned(), json!(true));
+            payload.insert("status".to_owned(), json!("order_creation_failed"));
+            payload.insert("errorMsg".to_owned(), json!(classified.message));
+            payload.insert("errorCode".to_owned(), json!(classified.code));
+            payload.insert("retryable".to_owned(), json!(classified.retryable));
+            payload.insert("errorPhase".to_owned(), json!("order_creation"));
+            return payload;
+        }
+    };
+
+    let post_result = match client
+        .post_order(&signed_order, "GTC", false, Some(false))
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let classified = classify_submit_error_message(&format_error_chain(&error));
+            payload.insert("attempted".to_owned(), json!(true));
+            payload.insert("status".to_owned(), json!("order_submit_failed"));
+            payload.insert("errorMsg".to_owned(), json!(classified.message));
+            payload.insert("errorCode".to_owned(), json!(classified.code));
+            payload.insert("retryable".to_owned(), json!(classified.retryable));
+            payload.insert("errorPhase".to_owned(), json!("order_submission"));
+            return payload;
+        }
+    };
+
+    payload.insert("attempted".to_owned(), json!(true));
+
+    let submit_success = extract_submit_success(&post_result);
+    let submit_status = extract_submit_status(&post_result);
+    let submit_error_message = extract_submit_error_message(&post_result);
+    let submit_error_code = submit_error_message
+        .as_deref()
+        .and_then(infer_submit_error_code);
+    let submit_rejected = submit_success == Some(false) || submit_error_message.is_some();
+
+    if submit_rejected {
+        let fallback_classified = classify_submit_error_message(
+            submit_error_message
+                .as_deref()
+                .unwrap_or("order submission rejected"),
+        );
+
+        let error_code = submit_error_code
+            .clone()
+            .unwrap_or_else(|| fallback_classified.code.clone());
+
+        let retryable = if submit_error_code.is_some() {
+            !is_non_retryable_submit_error(Some(error_code.as_str()))
+        } else {
+            fallback_classified.retryable
+        };
+
+        payload.insert(
+            "status".to_owned(),
+            json!(submit_status.as_deref().unwrap_or("order_submit_rejected")),
+        );
+        payload.insert(
+            "errorMsg".to_owned(),
+            json!(submit_error_message.unwrap_or(fallback_classified.message)),
+        );
+        payload.insert("errorCode".to_owned(), json!(error_code));
+        payload.insert("retryable".to_owned(), json!(retryable));
+        payload.insert("errorPhase".to_owned(), json!("order_submission"));
+        payload.insert("postResult".to_owned(), post_result);
+        return payload;
+    }
+
+    let order_id = extract_order_id(&post_result);
+    if order_id.is_empty() {
+        payload.insert(
+            "status".to_owned(),
+            json!(submit_status
+                .as_deref()
+                .unwrap_or("order_submit_missing_order_id")),
+        );
+        payload.insert(
+            "errorMsg".to_owned(),
+            json!(submit_error_message
+                .unwrap_or_else(|| "postOrder response does not contain orderID/id".to_owned())),
+        );
+        payload.insert("errorCode".to_owned(), json!("ORDER_ID_MISSING"));
+        payload.insert("retryable".to_owned(), json!(true));
+        payload.insert("errorPhase".to_owned(), json!("response_parse"));
+        payload.insert("postResult".to_owned(), post_result);
+        return payload;
+    }
+
+    payload.insert("success".to_owned(), json!(true));
+    payload.insert("orderId".to_owned(), json!(order_id));
+    payload.insert(
+        "status".to_owned(),
+        json!(submit_status.unwrap_or_else(|| "submitted".to_owned())),
+    );
+    payload.insert("postResult".to_owned(), post_result);
+
+    payload
+}
+
+async fn attach_post_fill_sell_limit(
+    config: &Config,
+    client: &ClobClient,
+    token_id: &str,
+    result: ExecutionResult,
+    attempt: u64,
+) -> ExecutionResult {
+    if !config.enable_post_fill_sell_limit {
+        return result;
+    }
+
+    let placement = submit_post_fill_sell_limit(config, client, token_id, result.filled_size).await;
+
+    let success = placement
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let attempted = placement
+        .get("attempted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if success {
+        let order_id = placement
+            .get("orderId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let size = placement.get("size").and_then(Value::as_f64).unwrap_or(0.0);
+        let price = placement
+            .get("finalPrice")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let status = placement
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("submitted");
+
+        log_info(
+            "Exit",
+            &format!(
+                "attempt #{} post-fill SELL accepted order={} size={:.6} price={:.3} status={}",
+                attempt, order_id, size, price, status
+            ),
+        );
+    } else if attempted {
+        let phase = placement
+            .get("errorPhase")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let code = placement
+            .get("errorCode")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN");
+        let status = placement
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let message = placement
+            .get("errorMsg")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+
+        log_warn(
+            "Exit",
+            &format!(
+                "attempt #{} post-fill SELL failed phase={} code={} status={} msg={}",
+                attempt, phase, code, status, message
+            ),
+        );
+    } else {
+        let message = placement
+            .get("errorMsg")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+
+        log_warn(
+            "Exit",
+            &format!("attempt #{} post-fill SELL skipped: {}", attempt, message),
+        );
+    }
+
+    let mut raw_response = result.raw_response.clone();
+    raw_response.insert("postFillSellLimit".to_owned(), Value::Object(placement));
+
+    ExecutionResult {
+        raw_response,
+        ..result
+    }
+}
+
 fn stop_for_attempt_limit(
     diagnostics: &mut EntryDiagnostics,
     config: &Config,
@@ -1098,7 +1465,10 @@ fn stop_for_attempt_limit(
 
     let mut extras = Map::new();
     extras.insert("maxAttempts".to_owned(), json!(config.order_max_attempts));
-    extras.insert("retryIntervalMs".to_owned(), json!(config.order_retry_interval_ms));
+    extras.insert(
+        "retryIntervalMs".to_owned(),
+        json!(config.order_retry_interval_ms),
+    );
 
     build_skipped_result("order_max_attempts_exceeded", diagnostics, extras)
 }
@@ -1168,7 +1538,10 @@ pub async fn execute_live_entry(
             );
 
             let mut extras = Map::new();
-            extras.insert("timeToCloseSec".to_owned(), json!(time_to_close_before_attempt));
+            extras.insert(
+                "timeToCloseSec".to_owned(),
+                json!(time_to_close_before_attempt),
+            );
 
             return Ok(build_skipped_result(
                 "entry_time_budget_exhausted_before_attempt",
@@ -1195,7 +1568,8 @@ pub async fn execute_live_entry(
 
                 let remaining_ms = close_time_sec.saturating_sub(now_sec()) * 1_000;
                 if remaining_ms <= config.order_retry_interval_ms {
-                    diagnostics.last_attempt_status = Some("ORDERBOOK_ERROR_UNTIL_CLOSE".to_owned());
+                    diagnostics.last_attempt_status =
+                        Some("ORDERBOOK_ERROR_UNTIL_CLOSE".to_owned());
 
                     let mut extras = Map::new();
                     extras.insert("error".to_owned(), json!(truncate_text(&message, 180)));
@@ -1292,7 +1666,16 @@ pub async fn execute_live_entry(
                 ));
             }
 
-            let slipped = apply_buy_slippage(orderbook.best_ask, config.entry_slippage_percent_buy);
+            let max_buy_price = if config.entry_price_gate_enabled {
+                config.price_range_max
+            } else {
+                0.98
+            };
+            let slipped = apply_buy_slippage(
+                orderbook.best_ask,
+                config.entry_slippage_percent_buy,
+                max_buy_price,
+            );
             let final_price = round_to_tick_ceil(slipped, &tick_size);
             diagnostics.last_final_price = Some(final_price);
 
@@ -1378,7 +1761,8 @@ pub async fn execute_live_entry(
             };
 
             if let Some(ref value) = result {
-                diagnostics.last_attempt_status = Some(format!("FOK_{}", status_label(value.status)));
+                diagnostics.last_attempt_status =
+                    Some(format!("FOK_{}", status_label(value.status)));
                 log_info(
                     "Entry",
                     &format!(
@@ -1405,8 +1789,13 @@ pub async fn execute_live_entry(
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
 
-                if value.status == ExecutionStatus::Filled || value.status == ExecutionStatus::Partial {
-                    return Ok(value);
+                if value.status == ExecutionStatus::Filled
+                    || value.status == ExecutionStatus::Partial
+                {
+                    return Ok(attach_post_fill_sell_limit(
+                        config, &client, token_id, value, attempt,
+                    )
+                    .await);
                 }
 
                 if should_stop {
@@ -1465,7 +1854,8 @@ pub async fn execute_live_entry(
             };
 
             if let Some(ref value) = fallback {
-                diagnostics.last_attempt_status = Some(format!("GTC_{}", status_label(value.status)));
+                diagnostics.last_attempt_status =
+                    Some(format!("GTC_{}", status_label(value.status)));
                 log_info(
                     "Entry",
                     &format!(
@@ -1485,8 +1875,13 @@ pub async fn execute_live_entry(
             }
 
             if let Some(value) = fallback {
-                if value.status == ExecutionStatus::Filled || value.status == ExecutionStatus::Partial {
-                    return Ok(value);
+                if value.status == ExecutionStatus::Filled
+                    || value.status == ExecutionStatus::Partial
+                {
+                    return Ok(attach_post_fill_sell_limit(
+                        config, &client, token_id, value, attempt,
+                    )
+                    .await);
                 }
             }
         } else {
@@ -1563,6 +1958,18 @@ mod tests {
     }
 
     #[test]
+    fn applies_aggressive_buy_slippage_with_fixed_markup_floor() {
+        let slipped = apply_buy_slippage(0.70, 2.5, 0.95);
+        assert!((slipped - 0.87).abs() < 0.000001);
+    }
+
+    #[test]
+    fn applies_aggressive_buy_slippage_with_cap() {
+        let slipped = apply_buy_slippage(0.90, 14.0, 0.95);
+        assert!((slipped - 0.95).abs() < 0.000001);
+    }
+
+    #[test]
     fn computes_market_buy_spent_from_requested_stake() {
         let spent = compute_spent_usd(
             SpentComputationContext {
@@ -1591,7 +1998,10 @@ mod tests {
         );
 
         assert!((spent.spent_usd - 0.35).abs() < 0.000001);
-        assert_eq!(spent.spent_source, "requested_stake_market_buy_capped_partial");
+        assert_eq!(
+            spent.spent_source,
+            "requested_stake_market_buy_capped_partial"
+        );
     }
 
     #[test]
@@ -1629,8 +2039,14 @@ mod tests {
         ]);
 
         let record = extract_status_record(&payload).expect("status record should be detected");
-        assert_eq!(record.get("status").and_then(Value::as_str), Some("MATCHED"));
-        assert_eq!(record.get("size_matched").and_then(Value::as_str), Some("10"));
+        assert_eq!(
+            record.get("status").and_then(Value::as_str),
+            Some("MATCHED")
+        );
+        assert_eq!(
+            record.get("size_matched").and_then(Value::as_str),
+            Some("10")
+        );
     }
 
     #[test]

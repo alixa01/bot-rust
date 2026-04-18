@@ -1,13 +1,13 @@
-use std::time::Duration;
 use std::str::FromStr;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use chrono::Utc;
 use ethers::signers::{LocalWallet, Signer};
-use ethers::types::{Address, U256};
 use ethers::types::transaction::eip712::TypedData;
+use ethers::types::{Address, U256};
 use ethers::utils::parse_units;
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -15,7 +15,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::Sha256;
 
-use crate::types::{SignatureType, Config};
+use crate::types::{Config, SignatureType};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -178,10 +178,7 @@ impl ClobClient {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| String::new());
+            let body = response.text().await.unwrap_or_else(|_| String::new());
 
             return Ok(Some(json!({
                 "source": "get_order_http_error",
@@ -260,9 +257,7 @@ impl ClobClient {
         }
 
         let parsed: Value = serde_json::from_str(&text).with_context(|| {
-            format!(
-                "failed to parse post order response (status={status}, body={text})"
-            )
+            format!("failed to parse post order response (status={status}, body={text})")
         })?;
 
         Ok(parsed)
@@ -322,6 +317,33 @@ impl ClobClient {
         .await
     }
 
+    pub async fn create_limit_order_sell(
+        &self,
+        token_id: &str,
+        size_shares: f64,
+        price: f64,
+        tick_size: &str,
+    ) -> Result<SignedOrder> {
+        let round = round_config_for_tick(tick_size)?;
+        let fee_rate_bps = self.get_fee_rate_bps(token_id).await?;
+        let neg_risk = self.get_neg_risk(token_id).await?;
+
+        let (side, raw_maker_amount, raw_taker_amount) =
+            get_limit_order_raw_amounts(OrderSide::Sell, size_shares, price, round)?;
+
+        self.create_signed_order(SignOrderParams {
+            token_id,
+            side,
+            raw_maker_amount,
+            raw_taker_amount,
+            fee_rate_bps,
+            expiration: 0,
+            nonce: 0,
+            neg_risk,
+        })
+        .await
+    }
+
     async fn create_signed_order(&self, params: SignOrderParams<'_>) -> Result<SignedOrder> {
         if !params.raw_maker_amount.is_finite() || params.raw_maker_amount <= 0.0 {
             bail!("invalid maker amount for signed order");
@@ -344,15 +366,19 @@ impl ClobClient {
         let signer = normalize_address_string("signer", &self.signer_address)?;
         let taker = normalize_address_string("taker", ZERO_ADDRESS)?;
         let token_id = normalize_uint256_string("tokenId", params.token_id)?;
-        let fee_rate_bps = normalize_uint256_string("feeRateBps", &params.fee_rate_bps.to_string())?;
+        let fee_rate_bps =
+            normalize_uint256_string("feeRateBps", &params.fee_rate_bps.to_string())?;
         let expiration = normalize_uint256_string("expiration", &params.expiration.to_string())?;
         let nonce = normalize_uint256_string("nonce", &params.nonce.to_string())?;
 
-        let verifying_contract = normalize_address_string("verifyingContract", if params.neg_risk {
-            NEG_RISK_EXCHANGE_POLYGON
-        } else {
-            EXCHANGE_POLYGON
-        })?;
+        let verifying_contract = normalize_address_string(
+            "verifyingContract",
+            if params.neg_risk {
+                NEG_RISK_EXCHANGE_POLYGON
+            } else {
+                EXCHANGE_POLYGON
+            },
+        )?;
 
         let typed_data_value = json!({
             "types": {
@@ -474,8 +500,7 @@ impl ClobClient {
         );
         headers.insert(
             HeaderName::from_bytes(b"POLY_TIMESTAMP")?,
-            HeaderValue::from_str(&timestamp_str)
-                .context("invalid POLY_TIMESTAMP header value")?,
+            HeaderValue::from_str(&timestamp_str).context("invalid POLY_TIMESTAMP header value")?,
         );
         headers.insert(
             HeaderName::from_bytes(b"POLY_API_KEY")?,
@@ -719,10 +744,7 @@ fn decode_api_secret(secret: &str) -> Result<Vec<u8>> {
     let sanitized: String = secret
         .trim()
         .chars()
-        .filter(|ch| {
-            ch.is_ascii_alphanumeric()
-                || matches!(*ch, '+' | '/' | '=' | '-' | '_')
-        })
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, '+' | '/' | '=' | '-' | '_'))
         .collect();
 
     if sanitized.is_empty() {
@@ -866,11 +888,11 @@ mod tests {
 
     #[test]
     fn normalizes_address() {
-        let value = normalize_address_string(
-            "maker",
-            "0x0000000000000000000000000000000000000001",
-        )
-        .unwrap();
-        assert_eq!(value.to_lowercase(), "0x0000000000000000000000000000000000000001");
+        let value = normalize_address_string("maker", "0x0000000000000000000000000000000000000001")
+            .unwrap();
+        assert_eq!(
+            value.to_lowercase(),
+            "0x0000000000000000000000000000000000000001"
+        );
     }
 }

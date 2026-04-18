@@ -15,7 +15,7 @@ use crate::storage::trade_logger::{
     log_trade_record, read_trade_records, update_trade_claim_status, ClaimStatusUpdate,
 };
 use crate::types::{
-    ClaimStatus, DiscoveredMarket, ExecutionStatus, MarketSide, PendingClaim, TradeRecord, Config,
+    ClaimStatus, Config, DiscoveredMarket, ExecutionStatus, MarketSide, PendingClaim, TradeRecord,
 };
 use crate::utils::logger::{log_cycle_separator, log_info, log_warn};
 use crate::utils::time::{build_window, now_sec, sleep_ms, sleep_until};
@@ -38,6 +38,21 @@ struct SideCandidate {
     token_id: String,
     ask_price: f64,
     bid_price: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PostFillSellLimitOutcome {
+    attempted: bool,
+    success: bool,
+    order_type: String,
+    size: f64,
+    final_price: Option<f64>,
+    status: Option<String>,
+    order_id: Option<String>,
+    retryable: Option<bool>,
+    error_code: Option<String>,
+    error_phase: Option<String>,
+    error_msg: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -76,6 +91,65 @@ fn trade_result_label(won: bool) -> &'static str {
     } else {
         "LOSS"
     }
+}
+
+fn parse_value_f64(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_post_fill_sell_limit_outcome(
+    raw_response: &HashMap<String, Value>,
+) -> Option<PostFillSellLimitOutcome> {
+    let placement = raw_response.get("postFillSellLimit")?.as_object()?;
+    if placement.get("enabled").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+
+    let attempted = placement
+        .get("attempted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let success = placement
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    Some(PostFillSellLimitOutcome {
+        attempted,
+        success,
+        order_type: placement
+            .get("orderType")
+            .and_then(Value::as_str)
+            .unwrap_or("GTC")
+            .to_owned(),
+        size: parse_value_f64(placement.get("size")).unwrap_or(0.0),
+        final_price: parse_value_f64(placement.get("finalPrice")),
+        status: placement
+            .get("status")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        order_id: placement
+            .get("orderId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        retryable: placement.get("retryable").and_then(Value::as_bool),
+        error_code: placement
+            .get("errorCode")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        error_phase: placement
+            .get("errorPhase")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        error_msg: placement
+            .get("errorMsg")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
 }
 
 fn should_manage_claims(config: &Config) -> bool {
@@ -215,9 +289,7 @@ async fn sweep_pending_claims(
                         let _ = telegram
                             .send(&format!(
                                 "[POLYMARKET BOT CLAIM OK]\ntrade : {}\nwindow: {}\ntx    : {}",
-                                trade_id,
-                                pending.window_slug,
-                                tx_label
+                                trade_id, pending.window_slug, tx_label
                             ))
                             .await;
                     }
@@ -303,7 +375,9 @@ async fn sweep_pending_claims(
                     );
                 }
 
-                if reached_failure_threshold && pending.claim_attempts < config.settlement_max_attempts {
+                if reached_failure_threshold
+                    && pending.claim_attempts < config.settlement_max_attempts
+                {
                     if telegram.enabled {
                         let _ = telegram
                             .send(&format!(
@@ -365,9 +439,7 @@ async fn sweep_pending_claims(
                     "Settlement",
                     &format!(
                         "claim sweep error trade={} attempt={} error={}",
-                        trade_id,
-                        next_claim_attempts,
-                        message
+                        trade_id, next_claim_attempts, message
                     ),
                 );
             }
@@ -394,7 +466,8 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
     let mut pause_notice_sent = false;
 
     if should_manage_claims(&config) {
-        if let Err(error) = restore_pending_claims_from_history(&config, &mut pending_claims).await {
+        if let Err(error) = restore_pending_claims_from_history(&config, &mut pending_claims).await
+        {
             log_warn(
                 "Settlement",
                 &format!("failed to restore pending claims: {error}"),
@@ -428,10 +501,17 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
             return Ok(());
         }
 
-        run_cycle(&config, &mut processed_windows, &mut pending_claims, &telegram).await?;
+        run_cycle(
+            &config,
+            &mut processed_windows,
+            &mut pending_claims,
+            &telegram,
+        )
+        .await?;
 
         if should_manage_claims(&config) {
-            if let Err(error) = sweep_pending_claims(&config, &mut pending_claims, &telegram).await {
+            if let Err(error) = sweep_pending_claims(&config, &mut pending_claims, &telegram).await
+            {
                 log_warn(
                     "Settlement",
                     &format!("claim sweep ended with error: {error}"),
@@ -444,7 +524,8 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
 
     loop {
         if should_manage_claims(&config) {
-            if let Err(error) = sweep_pending_claims(&config, &mut pending_claims, &telegram).await {
+            if let Err(error) = sweep_pending_claims(&config, &mut pending_claims, &telegram).await
+            {
                 log_warn(
                     "Settlement",
                     &format!("claim sweep ended with error: {error}"),
@@ -598,7 +679,10 @@ async fn fetch_side_candidate(
     }
 }
 
-async fn select_side_candidate(config: &Config, market: &DiscoveredMarket) -> Option<SideCandidate> {
+async fn select_side_candidate(
+    config: &Config,
+    market: &DiscoveredMarket,
+) -> Option<SideCandidate> {
     let up = fetch_side_candidate(config, MarketSide::Up, &market.yes_token_id).await;
     if up.is_some() {
         return up;
@@ -666,12 +750,19 @@ async fn run_cycle(
 
     log_info(
         "Market",
-        &format!("stage={:?} lookup slug={}", RuntimeStage::LookupMarket, window.slug),
+        &format!(
+            "stage={:?} lookup slug={}",
+            RuntimeStage::LookupMarket,
+            window.slug
+        ),
     );
 
     let market = lookup_market_until_deadline(config, &window.slug, window.close_time_sec).await?;
     let Some(market) = market else {
-        log_warn("Market", &format!("market not found for slug={}", window.slug));
+        log_warn(
+            "Market",
+            &format!("market not found for slug={}", window.slug),
+        );
         processed_windows.insert(window.window_start_sec);
         return Ok(());
     };
@@ -736,7 +827,52 @@ async fn run_cycle(
                 .await;
         }
 
-        let resolve_target_sec = window.close_time_sec.saturating_add(config.resolve_delay_sec);
+        if let Some(outcome) = parse_post_fill_sell_limit_outcome(&execution.raw_response) {
+            if telegram.enabled {
+                let title = if outcome.success {
+                    "[POLYMARKET BOT EXIT ORDER OK]"
+                } else {
+                    "[POLYMARKET BOT EXIT ORDER FAIL]"
+                };
+
+                let sell_price = outcome
+                    .final_price
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "n/a".to_owned());
+                let retryable = outcome
+                    .retryable
+                    .map(|value| if value { "yes" } else { "no" })
+                    .unwrap_or("n/a");
+
+                let _ = telegram
+                    .send(&format!(
+                        "{}\nwindow   : {}\nside     : {}\nbuyOrder : {}\nsellType : {}\nsellStat : {}\nsellId   : {}\nsellQty  : {:.6}\nsellPx   : {}\nattempted: {}\nretryable: {}\nerrCode  : {}\nerrPhase : {}\nerrMsg   : {}",
+                        title,
+                        window.slug,
+                        side_label(candidate.side),
+                        if execution.order_id.is_empty() {
+                            "n/a"
+                        } else {
+                            execution.order_id.as_str()
+                        },
+                        outcome.order_type,
+                        outcome.status.as_deref().unwrap_or("unknown"),
+                        outcome.order_id.as_deref().unwrap_or("n/a"),
+                        outcome.size,
+                        sell_price,
+                        if outcome.attempted { "yes" } else { "no" },
+                        retryable,
+                        outcome.error_code.as_deref().unwrap_or("-"),
+                        outcome.error_phase.as_deref().unwrap_or("-"),
+                        clip_text(outcome.error_msg.as_deref().unwrap_or("-"), 220),
+                    ))
+                    .await;
+            }
+        }
+
+        let resolve_target_sec = window
+            .close_time_sec
+            .saturating_add(config.resolve_delay_sec);
         if now_sec() < resolve_target_sec {
             let wait_sec = resolve_target_sec.saturating_sub(now_sec());
             log_info(
@@ -752,20 +888,28 @@ async fn run_cycle(
 
         log_info(
             "Settlement",
-            &format!("stage={:?} resolving window={}", RuntimeStage::Resolving, window.slug),
+            &format!(
+                "stage={:?} resolving window={}",
+                RuntimeStage::Resolving,
+                window.slug
+            ),
         );
 
-        let settlement = match resolve_window_outcome(config, window.window_start_sec, &window.slug).await {
-            Ok(value) => value,
-            Err(error) => {
-                log_warn(
-                    "Settlement",
-                    &format!("failed settlement resolution for {}: {}", window.slug, error),
-                );
-                processed_windows.insert(window.window_start_sec);
-                return Ok(());
-            }
-        };
+        let settlement =
+            match resolve_window_outcome(config, window.window_start_sec, &window.slug).await {
+                Ok(value) => value,
+                Err(error) => {
+                    log_warn(
+                        "Settlement",
+                        &format!(
+                            "failed settlement resolution for {}: {}",
+                            window.slug, error
+                        ),
+                    );
+                    processed_windows.insert(window.window_start_sec);
+                    return Ok(());
+                }
+            };
 
         let pnl = compute_trade_pnl(candidate.side, &execution, settlement.outcome);
         let won = matches!(pnl.outcome, crate::types::TradeResult::Win);
@@ -797,7 +941,11 @@ async fn run_cycle(
             claim_attempts: if claim_enabled { Some(0) } else { None },
             claim_tx_hash: None,
             claim_last_error: None,
-            claim_updated_at_ms: if claim_enabled { Some(timestamp_ms) } else { None },
+            claim_updated_at_ms: if claim_enabled {
+                Some(timestamp_ms)
+            } else {
+                None
+            },
             market_resolved: if claim_enabled { Some(false) } else { None },
             market_resolution_source: None,
             market_resolved_at_ms: None,
@@ -806,7 +954,10 @@ async fn run_cycle(
         if let Err(error) = log_trade_record(&config.trades_output_path, &trade_record).await {
             log_warn(
                 "Storage",
-                &format!("failed to persist trade record on {}: {}", window.slug, error),
+                &format!(
+                    "failed to persist trade record on {}: {}",
+                    window.slug, error
+                ),
             );
         }
 

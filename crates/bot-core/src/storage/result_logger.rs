@@ -36,7 +36,11 @@ pub async fn log_result_row(path: &Path, row: &ResultRow) -> Result<LogStatus> {
         fs::create_dir_all(parent).await?;
     }
 
-    let mut file = OpenOptions::new().create(true).append(true).open(path).await?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
     let line = format!("{}\n", serde_json::to_string(row)?);
     file.write_all(line.as_bytes()).await?;
     file.flush().await?;

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
-use crate::types::{OrderBookSnapshot, Config};
+use crate::types::{Config, OrderBookSnapshot};
 
 #[derive(Debug, Deserialize)]
 struct BookLevelRaw {
@@ -55,7 +55,10 @@ fn parse_best_bid(bids: &[BookLevelRaw]) -> f64 {
     numeric.first().copied().unwrap_or(0.0)
 }
 
-pub async fn fetch_orderbook_snapshot(config: &Config, token_id: &str) -> Result<OrderBookSnapshot> {
+pub async fn fetch_orderbook_snapshot(
+    config: &Config,
+    token_id: &str,
+) -> Result<OrderBookSnapshot> {
     let base = config.polymarket_clob_url.trim_end_matches('/');
     let url = format!("{base}/book");
 

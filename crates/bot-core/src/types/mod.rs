@@ -263,6 +263,8 @@ pub struct Config {
     pub entry_price_gate_enabled: bool,
     pub entry_slippage_percent_buy: f64,
     pub enable_fallback_gtc_limit: bool,
+    pub enable_post_fill_sell_limit: bool,
+    pub post_fill_sell_limit_price: f64,
     pub check_before_close_sec: u64,
     pub resolve_delay_sec: u64,
     pub idle_poll_interval_ms: u64,

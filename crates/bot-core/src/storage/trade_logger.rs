@@ -40,7 +40,9 @@ pub async fn read_trade_records(path: &Path) -> Result<Vec<TradeRecord>> {
     let content = match fs::read_to_string(path).await {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error).with_context(|| format!("failed reading {}", path.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed reading {}", path.display()))
+        }
     };
 
     let mut out = Vec::new();
