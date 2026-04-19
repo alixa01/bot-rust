@@ -1,16 +1,21 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
-use anyhow::{Error, Result};
+use anyhow::{anyhow, Error, Result};
+use ethers::types::U256;
+use ethers::utils::parse_units;
 use serde_json::{json, Map, Value};
 
 use crate::data::orderbook::fetch_orderbook_snapshot;
-use crate::execution::client::{get_clob_client, ClobClient};
+use crate::execution::client::{get_clob_client, ClobClient, ConditionalBalanceAllowance};
 use crate::types::{Config, ExecutionResult, ExecutionStatus};
 use crate::utils::logger::{log_error, log_info, log_warn};
 use crate::utils::time::{now_sec, sleep_ms};
 
 const STATUS_POLL_WARN_BURST: u64 = 3;
 const STATUS_POLL_UNAVAILABLE_ABORT_COUNT: u64 = 8;
+const POST_FILL_SELL_BALANCE_CHECK_MAX_WAIT_MS: u64 = 30_000;
+const POST_FILL_SELL_BALANCE_CHECK_WARN_BURST: u64 = 5;
 
 #[derive(Debug, Clone)]
 struct EntryDiagnostics {
@@ -65,6 +70,18 @@ struct ClassifiedSubmitError {
     message: String,
     code: String,
     retryable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SellAvailabilityCheckResult {
+    ready: bool,
+    poll_count: u64,
+    elapsed_ms: u64,
+    required_raw: String,
+    available_raw: Option<String>,
+    balance_raw: Option<String>,
+    allowance_raw: Option<String>,
+    last_error: Option<String>,
 }
 
 struct SubmitFokParams<'a> {
@@ -1185,6 +1202,145 @@ fn round_size_to_6_decimals(value: f64) -> f64 {
     (value * factor).round() / factor
 }
 
+fn encode_amount_to_6_decimals_units(field: &str, value: f64) -> Result<U256> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(anyhow!("{field} must be finite and > 0"));
+    }
+
+    let fixed = format!("{value:.6}");
+    let parsed = parse_units(&fixed, 6)
+        .map_err(|error| anyhow!("failed to encode {field} in 6-decimal units: {error}"))?;
+
+    Ok(parsed.into())
+}
+
+fn build_sell_availability_payload(
+    result: &SellAvailabilityCheckResult,
+    interval_ms: u64,
+) -> Value {
+    let mut payload = Map::new();
+    payload.insert("intervalMs".to_owned(), json!(interval_ms));
+    payload.insert(
+        "maxWaitMs".to_owned(),
+        json!(POST_FILL_SELL_BALANCE_CHECK_MAX_WAIT_MS),
+    );
+    payload.insert("pollCount".to_owned(), json!(result.poll_count));
+    payload.insert("elapsedMs".to_owned(), json!(result.elapsed_ms));
+    payload.insert("ready".to_owned(), json!(result.ready));
+    payload.insert("requiredRaw".to_owned(), json!(result.required_raw.clone()));
+    payload.insert(
+        "availableRaw".to_owned(),
+        json!(result.available_raw.clone()),
+    );
+    payload.insert("balanceRaw".to_owned(), json!(result.balance_raw.clone()));
+    payload.insert(
+        "allowanceRaw".to_owned(),
+        json!(result.allowance_raw.clone()),
+    );
+    payload.insert("lastError".to_owned(), json!(result.last_error.clone()));
+
+    Value::Object(payload)
+}
+
+fn evaluate_sell_availability(
+    snapshot: &ConditionalBalanceAllowance,
+    required_units: &U256,
+) -> (bool, String) {
+    let available_units = snapshot.available_units();
+    let available_raw = available_units.to_string();
+    (available_units >= *required_units, available_raw)
+}
+
+async fn wait_for_post_fill_sell_availability(
+    config: &Config,
+    client: &ClobClient,
+    token_id: &str,
+    required_units: U256,
+) -> SellAvailabilityCheckResult {
+    let interval_ms = config.post_fill_sell_balance_check_interval_ms.max(1);
+    let required_raw = required_units.to_string();
+    let started = Instant::now();
+
+    let mut poll_count = 0_u64;
+    let mut available_raw: Option<String> = None;
+    let mut balance_raw: Option<String> = None;
+    let mut allowance_raw: Option<String> = None;
+    let mut last_error: Option<String> = None;
+
+    loop {
+        poll_count += 1;
+
+        match client.get_conditional_balance_allowance(token_id).await {
+            Ok(snapshot) => {
+                let (ready, current_available_raw) =
+                    evaluate_sell_availability(&snapshot, &required_units);
+
+                balance_raw = Some(snapshot.balance_raw.clone());
+                allowance_raw = Some(snapshot.allowance_raw.clone());
+                available_raw = Some(current_available_raw.clone());
+
+                if ready {
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    return SellAvailabilityCheckResult {
+                        ready: true,
+                        poll_count,
+                        elapsed_ms,
+                        required_raw,
+                        available_raw,
+                        balance_raw,
+                        allowance_raw,
+                        last_error,
+                    };
+                }
+
+                if poll_count == 1 || poll_count % POST_FILL_SELL_BALANCE_CHECK_WARN_BURST == 0 {
+                    log_info(
+                        "Exit",
+                        &format!(
+                            "post-fill SELL waiting balance/allowance token={} poll#{} available={} required={} interval={}ms",
+                            token_id,
+                            poll_count,
+                            current_available_raw,
+                            required_raw,
+                            interval_ms
+                        ),
+                    );
+                }
+            }
+            Err(error) => {
+                let message = compact_error_message(&format_error_chain(&error), 180);
+                last_error = Some(message.clone());
+
+                if poll_count == 1 || poll_count % POST_FILL_SELL_BALANCE_CHECK_WARN_BURST == 0 {
+                    log_warn(
+                        "Exit",
+                        &format!(
+                            "post-fill SELL balance/allowance check failed token={} poll#{} msg={}",
+                            token_id, poll_count, message
+                        ),
+                    );
+                }
+            }
+        }
+
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms >= POST_FILL_SELL_BALANCE_CHECK_MAX_WAIT_MS {
+            return SellAvailabilityCheckResult {
+                ready: false,
+                poll_count,
+                elapsed_ms,
+                required_raw,
+                available_raw,
+                balance_raw,
+                allowance_raw,
+                last_error,
+            };
+        }
+
+        sleep_ms(interval_ms).await;
+    }
+}
+
 fn build_post_fill_sell_limit_payload(
     token_id: &str,
     requested_price: f64,
@@ -1231,6 +1387,76 @@ async fn submit_post_fill_sell_limit(
         payload.insert("retryable".to_owned(), json!(false));
         return payload;
     }
+
+    let required_units = match encode_amount_to_6_decimals_units("filled_size", normalized_size) {
+        Ok(value) => value,
+        Err(error) => {
+            payload.insert(
+                "status".to_owned(),
+                json!("skipped_invalid_filled_size_units"),
+            );
+            payload.insert(
+                "errorMsg".to_owned(),
+                json!(compact_error_message(&format_error_chain(&error), 180)),
+            );
+            payload.insert("errorCode".to_owned(), json!("SELL_SIZE_UNITS_INVALID"));
+            payload.insert("retryable".to_owned(), json!(false));
+            payload.insert("errorPhase".to_owned(), json!("pre_submit_balance_check"));
+            return payload;
+        }
+    };
+
+    let availability =
+        wait_for_post_fill_sell_availability(config, client, token_id, required_units).await;
+
+    payload.insert(
+        "preSubmitBalanceCheck".to_owned(),
+        build_sell_availability_payload(
+            &availability,
+            config.post_fill_sell_balance_check_interval_ms,
+        ),
+    );
+
+    if !availability.ready {
+        let fallback_msg = if let Some(last_error) = availability.last_error.as_deref() {
+            format!(
+                "balance/allowance not ready within {}ms; last error: {}",
+                availability.elapsed_ms, last_error
+            )
+        } else {
+            format!(
+                "balance/allowance not ready within {}ms (available={} required={})",
+                availability.elapsed_ms,
+                availability.available_raw.as_deref().unwrap_or("unknown"),
+                availability.required_raw
+            )
+        };
+
+        payload.insert(
+            "status".to_owned(),
+            json!("skipped_balance_allowance_unavailable"),
+        );
+        payload.insert("errorMsg".to_owned(), json!(fallback_msg));
+        payload.insert(
+            "errorCode".to_owned(),
+            json!("SELL_BALANCE_ALLOWANCE_UNAVAILABLE"),
+        );
+        payload.insert("retryable".to_owned(), json!(true));
+        payload.insert("errorPhase".to_owned(), json!("pre_submit_balance_check"));
+        return payload;
+    }
+
+    log_info(
+        "Exit",
+        &format!(
+            "post-fill SELL balance/allowance ready token={} available={} required={} polls={} wait={}ms",
+            token_id,
+            availability.available_raw.as_deref().unwrap_or("unknown"),
+            availability.required_raw,
+            availability.poll_count,
+            availability.elapsed_ms
+        ),
+    );
 
     let tick_size = match client.get_tick_size(token_id).await {
         Ok(value) => value,

@@ -63,6 +63,24 @@ pub struct SignedOrder {
     pub signature: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConditionalBalanceAllowance {
+    pub balance_raw: String,
+    pub allowance_raw: String,
+    pub balance_units: U256,
+    pub allowance_units: U256,
+}
+
+impl ConditionalBalanceAllowance {
+    pub fn available_units(&self) -> U256 {
+        if self.balance_units < self.allowance_units {
+            self.balance_units
+        } else {
+            self.allowance_units
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RoundingConfig {
     price_decimals: u32,
@@ -194,6 +212,86 @@ impl ClobClient {
             .with_context(|| format!("failed to parse order status response for {order_id}"))?;
 
         Ok(Some(payload))
+    }
+
+    pub async fn get_conditional_balance_allowance(
+        &self,
+        token_id: &str,
+    ) -> Result<ConditionalBalanceAllowance> {
+        let request_path = "/balance-allowance";
+        let headers = self.build_l2_headers("GET", request_path, None)?;
+        let signature_type = self.signature_type.to_string();
+
+        let response = self
+            .http_client
+            .get(format!("{}{}", self.host, request_path))
+            .headers(headers)
+            .query(&[
+                ("asset_type", "CONDITIONAL"),
+                ("token_id", token_id),
+                ("signature_type", signature_type.as_str()),
+            ])
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to fetch balance-allowance for conditional token {}",
+                    token_id
+                )
+            })?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("failed to read balance-allowance response body")?;
+
+        if !status.is_success() {
+            bail!(
+                "balance-allowance failed with HTTP {} body={} tokenId={}",
+                status.as_u16(),
+                truncate_text(&text, 220),
+                token_id
+            );
+        }
+
+        let payload: Value = serde_json::from_str(&text).with_context(|| {
+            format!(
+                "failed to parse balance-allowance payload for token {} body={}",
+                token_id,
+                truncate_text(&text, 220)
+            )
+        })?;
+
+        if let Some(message) = payload.get("error").and_then(Value::as_str) {
+            bail!(
+                "balance-allowance endpoint returned error for token {}: {}",
+                token_id,
+                message
+            );
+        }
+
+        let balance_raw = payload
+            .get("balance")
+            .and_then(value_to_string)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("balance-allowance payload missing balance"))?;
+
+        let allowance_raw = payload
+            .get("allowance")
+            .and_then(value_to_string)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("balance-allowance payload missing allowance"))?;
+
+        let balance_units = parse_balance_allowance_units("balance", &balance_raw)?;
+        let allowance_units = parse_balance_allowance_units("allowance", &allowance_raw)?;
+
+        Ok(ConditionalBalanceAllowance {
+            balance_raw,
+            allowance_raw,
+            balance_units,
+            allowance_units,
+        })
     }
 
     pub async fn post_order(
@@ -793,6 +891,35 @@ fn value_to_f64(value: &Value) -> Option<f64> {
     }
 }
 
+fn value_to_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.trim().to_owned()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_balance_allowance_units(field_name: &str, raw: &str) -> Result<U256> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{field_name} must not be empty");
+    }
+
+    if trimmed.contains('.') {
+        let parsed = parse_units(trimmed, 6)
+            .with_context(|| format!("{field_name} must be valid decimal amount, got: {raw}"))?;
+        return Ok(parsed.into());
+    }
+
+    if let Ok(parsed) = U256::from_dec_str(trimmed) {
+        return Ok(parsed);
+    }
+
+    let parsed = parse_units(trimmed, 6)
+        .with_context(|| format!("{field_name} must be valid amount, got: {raw}"))?;
+    Ok(parsed.into())
+}
+
 fn truncate_text(value: &str, max_chars: usize) -> String {
     if value.chars().count() <= max_chars {
         return value.to_owned();
@@ -894,5 +1021,17 @@ mod tests {
             value.to_lowercase(),
             "0x0000000000000000000000000000000000000001"
         );
+    }
+
+    #[test]
+    fn parses_balance_allowance_units_from_fixed_int() {
+        let parsed = parse_balance_allowance_units("balance", "1050000").unwrap();
+        assert_eq!(parsed.to_string(), "1050000");
+    }
+
+    #[test]
+    fn parses_balance_allowance_units_from_decimal() {
+        let parsed = parse_balance_allowance_units("balance", "1.05").unwrap();
+        assert_eq!(parsed.to_string(), "1050000");
     }
 }

@@ -53,6 +53,8 @@ bash scripts/bootstrap_env.sh
   If `true`, bot immediately places a SELL limit order after BUY is `FILLED` or `PARTIAL`.
 - `POST_FILL_SELL_LIMIT_PRICE`:
   Absolute SELL limit price used for post-fill exit placement. Valid range: `0.01` to `0.99`.
+- `POST_FILL_SELL_BALANCE_CHECK_INTERVAL_MS`:
+  Poll interval (milliseconds) for pre-submit conditional-token `balance/allowance` checks before post-fill SELL. SELL is submitted only after `min(balance, allowance) >= required_qty`.
 
 ## Run
 
