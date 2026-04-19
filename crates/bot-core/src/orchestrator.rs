@@ -260,6 +260,8 @@ async fn sweep_pending_claims(
             &trade_id,
             &pending.window_slug,
             &pending.condition_id,
+            &pending.yes_token_id,
+            &pending.no_token_id,
         )
         .await
         {

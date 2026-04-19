@@ -1,0 +1,11 @@
+{
+  "name": "bot-rust-relayer-helper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local runtime dependencies for bot-rust RELAYER_SAFE helper",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "ethers": "^5.8.0"
+  }
+}

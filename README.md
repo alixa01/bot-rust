@@ -43,7 +43,14 @@ cd "e:/Project/Polymarket Bot/BOT V2.0/bot-rust"
 bash scripts/bootstrap_env.sh
 ```
 
-2. Runtime uses bot-rust/.env only.
+2. Install local relayer helper dependencies (inside bot-rust only):
+
+```bash
+cd "e:/Project/Polymarket Bot/BOT V2.0/bot-rust"
+npm install
+```
+
+3. Runtime uses bot-rust/.env only.
 
 ## Key Environment Keys
 
@@ -76,3 +83,4 @@ cargo test -p bot-tests
 
 - Keep stake small during future live smoke testing.
 - Rotate secrets if current .env values were exposed or shared.
+- RELAYER_SAFE claim path uses `scripts/relayer_redeem_safe.cjs` with dependencies from local `bot-rust/node_modules` only.

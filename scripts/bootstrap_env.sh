@@ -18,3 +18,4 @@ fi
 
 cp "$SOURCE_ENV_PATH" "$TARGET_ENV_PATH"
 echo "Copied $SOURCE_ENV_PATH -> $TARGET_ENV_PATH"
+echo "For RELAYER_SAFE mode, run: cd \"$BOT_RUST_DIR\" && npm install"
