@@ -12,7 +12,7 @@ use ethers::utils::parse_units;
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::Sha256;
 
 use crate::types::{Config, SignatureType};
@@ -271,17 +271,14 @@ impl ClobClient {
             );
         }
 
-        let balance_raw = payload
-            .get("balance")
-            .and_then(value_to_string)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("balance-allowance payload missing balance"))?;
-
-        let allowance_raw = payload
-            .get("allowance")
-            .and_then(value_to_string)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("balance-allowance payload missing allowance"))?;
+        let (balance_raw, allowance_raw) =
+            parse_balance_allowance_payload(&payload).with_context(|| {
+                format!(
+                    "unexpected balance-allowance payload shape token={} payload={}",
+                    token_id,
+                    truncate_text(&payload.to_string(), 220)
+                )
+            })?;
 
         let balance_units = parse_balance_allowance_units("balance", &balance_raw)?;
         let allowance_units = parse_balance_allowance_units("allowance", &allowance_raw)?;
@@ -891,12 +888,90 @@ fn value_to_f64(value: &Value) -> Option<f64> {
     }
 }
 
-fn value_to_string(value: &Value) -> Option<String> {
+fn first_amount_string(value: &Value) -> Option<String> {
     match value {
-        Value::String(text) => Some(text.trim().to_owned()),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
         Value::Number(number) => Some(number.to_string()),
+        Value::Array(items) => items.iter().find_map(first_amount_string),
+        Value::Object(map) => {
+            let preferred_keys = [
+                "amount",
+                "value",
+                "raw",
+                "balance",
+                "allowance",
+                "available",
+                "approved",
+            ];
+
+            for key in preferred_keys {
+                if let Some(found) = map.get(key).and_then(first_amount_string) {
+                    return Some(found);
+                }
+            }
+
+            map.values().find_map(first_amount_string)
+        }
         _ => None,
     }
+}
+
+fn read_amount_from_object(object: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(found) = object.get(*key).and_then(first_amount_string) {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+fn read_amount_from_payload(payload: &Value, keys: &[&str]) -> Option<String> {
+    if let Some(object) = payload.as_object() {
+        if let Some(found) = read_amount_from_object(object, keys) {
+            return Some(found);
+        }
+
+        if let Some(data) = object.get("data").and_then(Value::as_object) {
+            if let Some(found) = read_amount_from_object(data, keys) {
+                return Some(found);
+            }
+        }
+
+        if let Some(result) = object.get("result").and_then(Value::as_object) {
+            if let Some(found) = read_amount_from_object(result, keys) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_balance_allowance_payload(payload: &Value) -> Result<(String, String)> {
+    let balance_keys = ["balance", "available", "available_balance", "balance_raw"];
+    let allowance_keys = [
+        "allowance",
+        "allowances",
+        "approved",
+        "approval",
+        "available_allowance",
+    ];
+
+    let balance_raw = read_amount_from_payload(payload, &balance_keys)
+        .ok_or_else(|| anyhow!("balance-allowance payload missing balance"))?;
+
+    let allowance_raw =
+        read_amount_from_payload(payload, &allowance_keys).unwrap_or_else(|| balance_raw.clone());
+
+    Ok((balance_raw, allowance_raw))
 }
 
 fn parse_balance_allowance_units(field_name: &str, raw: &str) -> Result<U256> {
@@ -1033,5 +1108,30 @@ mod tests {
     fn parses_balance_allowance_units_from_decimal() {
         let parsed = parse_balance_allowance_units("balance", "1.05").unwrap();
         assert_eq!(parsed.to_string(), "1050000");
+    }
+
+    #[test]
+    fn parses_balance_allowance_from_nested_data_shape() {
+        let payload = json!({
+            "data": {
+                "balance": "1050000",
+                "allowance": "1000000"
+            }
+        });
+
+        let (balance, allowance) = parse_balance_allowance_payload(&payload).unwrap();
+        assert_eq!(balance, "1050000");
+        assert_eq!(allowance, "1000000");
+    }
+
+    #[test]
+    fn falls_back_allowance_to_balance_when_allowance_missing() {
+        let payload = json!({
+            "balance": "1050000"
+        });
+
+        let (balance, allowance) = parse_balance_allowance_payload(&payload).unwrap();
+        assert_eq!(balance, "1050000");
+        assert_eq!(allowance, "1050000");
     }
 }

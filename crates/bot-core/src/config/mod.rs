@@ -188,6 +188,8 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     let post_fill_sell_limit_price = number_env("POST_FILL_SELL_LIMIT_PRICE", 0.85)?;
     let post_fill_sell_balance_check_interval_ms =
         floor_u64_env("POST_FILL_SELL_BALANCE_CHECK_INTERVAL_MS", 400.0)?;
+    let post_fill_sell_balance_check_max_retries =
+        floor_u64_env("POST_FILL_SELL_BALANCE_CHECK_MAX_RETRIES", 75.0)?;
 
     let check_before_close_sec = floor_u64_env("CHECK_BEFORE_CLOSE_SECONDS", 10.0)?;
     let resolve_delay_sec = floor_u64_env("RESOLVE_DELAY_SECONDS", 2.0)?;
@@ -328,6 +330,9 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     if post_fill_sell_balance_check_interval_ms == 0 {
         bail!("POST_FILL_SELL_BALANCE_CHECK_INTERVAL_MS must be > 0");
     }
+    if post_fill_sell_balance_check_max_retries == 0 {
+        bail!("POST_FILL_SELL_BALANCE_CHECK_MAX_RETRIES must be > 0");
+    }
     if check_before_close_sec == 0 {
         bail!("CHECK_BEFORE_CLOSE_SECONDS must be > 0");
     }
@@ -426,6 +431,7 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
         enable_post_fill_sell_limit,
         post_fill_sell_limit_price,
         post_fill_sell_balance_check_interval_ms,
+        post_fill_sell_balance_check_max_retries,
         check_before_close_sec,
         resolve_delay_sec,
         idle_poll_interval_ms,

@@ -55,6 +55,8 @@ bash scripts/bootstrap_env.sh
   Absolute SELL limit price used for post-fill exit placement. Valid range: `0.01` to `0.99`.
 - `POST_FILL_SELL_BALANCE_CHECK_INTERVAL_MS`:
   Poll interval (milliseconds) for pre-submit conditional-token `balance/allowance` checks before post-fill SELL. SELL is submitted only after `min(balance, allowance) >= required_qty`.
+- `POST_FILL_SELL_BALANCE_CHECK_MAX_RETRIES`:
+  Maximum number of balance/allowance polling attempts before post-fill SELL is skipped with diagnostics.
 
 ## Run
 

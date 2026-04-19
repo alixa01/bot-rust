@@ -77,6 +77,7 @@ struct SellAvailabilityCheckResult {
     ready: bool,
     poll_count: u64,
     elapsed_ms: u64,
+    stop_reason: Option<String>,
     required_raw: String,
     available_raw: Option<String>,
     balance_raw: Option<String>,
@@ -1217,15 +1218,18 @@ fn encode_amount_to_6_decimals_units(field: &str, value: f64) -> Result<U256> {
 fn build_sell_availability_payload(
     result: &SellAvailabilityCheckResult,
     interval_ms: u64,
+    max_retries: u64,
 ) -> Value {
     let mut payload = Map::new();
     payload.insert("intervalMs".to_owned(), json!(interval_ms));
+    payload.insert("maxRetries".to_owned(), json!(max_retries));
     payload.insert(
         "maxWaitMs".to_owned(),
         json!(POST_FILL_SELL_BALANCE_CHECK_MAX_WAIT_MS),
     );
     payload.insert("pollCount".to_owned(), json!(result.poll_count));
     payload.insert("elapsedMs".to_owned(), json!(result.elapsed_ms));
+    payload.insert("stopReason".to_owned(), json!(result.stop_reason.clone()));
     payload.insert("ready".to_owned(), json!(result.ready));
     payload.insert("requiredRaw".to_owned(), json!(result.required_raw.clone()));
     payload.insert(
@@ -1258,6 +1262,7 @@ async fn wait_for_post_fill_sell_availability(
     required_units: U256,
 ) -> SellAvailabilityCheckResult {
     let interval_ms = config.post_fill_sell_balance_check_interval_ms.max(1);
+    let max_retries = config.post_fill_sell_balance_check_max_retries.max(1);
     let required_raw = required_units.to_string();
     let started = Instant::now();
 
@@ -1285,6 +1290,7 @@ async fn wait_for_post_fill_sell_availability(
                         ready: true,
                         poll_count,
                         elapsed_ms,
+                        stop_reason: None,
                         required_raw,
                         available_raw,
                         balance_raw,
@@ -1323,12 +1329,28 @@ async fn wait_for_post_fill_sell_availability(
             }
         }
 
+        if poll_count >= max_retries {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            return SellAvailabilityCheckResult {
+                ready: false,
+                poll_count,
+                elapsed_ms,
+                stop_reason: Some("max_retries_reached".to_owned()),
+                required_raw,
+                available_raw,
+                balance_raw,
+                allowance_raw,
+                last_error,
+            };
+        }
+
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if elapsed_ms >= POST_FILL_SELL_BALANCE_CHECK_MAX_WAIT_MS {
             return SellAvailabilityCheckResult {
                 ready: false,
                 poll_count,
                 elapsed_ms,
+                stop_reason: Some("max_wait_reached".to_owned()),
                 required_raw,
                 available_raw,
                 balance_raw,
@@ -1414,18 +1436,22 @@ async fn submit_post_fill_sell_limit(
         build_sell_availability_payload(
             &availability,
             config.post_fill_sell_balance_check_interval_ms,
+            config.post_fill_sell_balance_check_max_retries,
         ),
     );
 
     if !availability.ready {
+        let stop_reason = availability.stop_reason.as_deref().unwrap_or("unknown");
+
         let fallback_msg = if let Some(last_error) = availability.last_error.as_deref() {
             format!(
-                "balance/allowance not ready within {}ms; last error: {}",
-                availability.elapsed_ms, last_error
+                "balance/allowance not ready (reason={}) within {}ms; last error: {}",
+                stop_reason, availability.elapsed_ms, last_error
             )
         } else {
             format!(
-                "balance/allowance not ready within {}ms (available={} required={})",
+                "balance/allowance not ready (reason={}) within {}ms (available={} required={})",
+                stop_reason,
                 availability.elapsed_ms,
                 availability.available_raw.as_deref().unwrap_or("unknown"),
                 availability.required_raw
