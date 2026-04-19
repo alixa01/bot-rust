@@ -1,21 +1,16 @@
 use std::collections::HashMap;
-use std::time::Instant;
 
-use anyhow::{anyhow, Error, Result};
-use ethers::types::U256;
-use ethers::utils::parse_units;
+use anyhow::{Error, Result};
 use serde_json::{json, Map, Value};
 
 use crate::data::orderbook::fetch_orderbook_snapshot;
-use crate::execution::client::{get_clob_client, ClobClient, ConditionalBalanceAllowance};
+use crate::execution::client::{get_clob_client, ClobClient};
 use crate::types::{Config, ExecutionResult, ExecutionStatus};
 use crate::utils::logger::{log_error, log_info, log_warn};
 use crate::utils::time::{now_sec, sleep_ms};
 
 const STATUS_POLL_WARN_BURST: u64 = 3;
 const STATUS_POLL_UNAVAILABLE_ABORT_COUNT: u64 = 8;
-const POST_FILL_SELL_BALANCE_CHECK_MAX_WAIT_MS: u64 = 30_000;
-const POST_FILL_SELL_BALANCE_CHECK_WARN_BURST: u64 = 5;
 
 #[derive(Debug, Clone)]
 struct EntryDiagnostics {
@@ -70,19 +65,6 @@ struct ClassifiedSubmitError {
     message: String,
     code: String,
     retryable: bool,
-}
-
-#[derive(Debug, Clone)]
-struct SellAvailabilityCheckResult {
-    ready: bool,
-    poll_count: u64,
-    elapsed_ms: u64,
-    stop_reason: Option<String>,
-    required_raw: String,
-    available_raw: Option<String>,
-    balance_raw: Option<String>,
-    allowance_raw: Option<String>,
-    last_error: Option<String>,
 }
 
 struct SubmitFokParams<'a> {
@@ -1203,164 +1185,19 @@ fn round_size_to_6_decimals(value: f64) -> f64 {
     (value * factor).round() / factor
 }
 
-fn encode_amount_to_6_decimals_units(field: &str, value: f64) -> Result<U256> {
-    if !value.is_finite() || value <= 0.0 {
-        return Err(anyhow!("{field} must be finite and > 0"));
-    }
-
-    let fixed = format!("{value:.6}");
-    let parsed = parse_units(&fixed, 6)
-        .map_err(|error| anyhow!("failed to encode {field} in 6-decimal units: {error}"))?;
-
-    Ok(parsed.into())
-}
-
-fn build_sell_availability_payload(
-    result: &SellAvailabilityCheckResult,
+fn build_sell_submit_retry_payload(
     interval_ms: u64,
     max_retries: u64,
+    attempts_used: u64,
+    exhausted: bool,
 ) -> Value {
     let mut payload = Map::new();
     payload.insert("intervalMs".to_owned(), json!(interval_ms));
     payload.insert("maxRetries".to_owned(), json!(max_retries));
-    payload.insert(
-        "maxWaitMs".to_owned(),
-        json!(POST_FILL_SELL_BALANCE_CHECK_MAX_WAIT_MS),
-    );
-    payload.insert("pollCount".to_owned(), json!(result.poll_count));
-    payload.insert("elapsedMs".to_owned(), json!(result.elapsed_ms));
-    payload.insert("stopReason".to_owned(), json!(result.stop_reason.clone()));
-    payload.insert("ready".to_owned(), json!(result.ready));
-    payload.insert("requiredRaw".to_owned(), json!(result.required_raw.clone()));
-    payload.insert(
-        "availableRaw".to_owned(),
-        json!(result.available_raw.clone()),
-    );
-    payload.insert("balanceRaw".to_owned(), json!(result.balance_raw.clone()));
-    payload.insert(
-        "allowanceRaw".to_owned(),
-        json!(result.allowance_raw.clone()),
-    );
-    payload.insert("lastError".to_owned(), json!(result.last_error.clone()));
+    payload.insert("attemptsUsed".to_owned(), json!(attempts_used));
+    payload.insert("exhausted".to_owned(), json!(exhausted));
 
     Value::Object(payload)
-}
-
-fn evaluate_sell_availability(
-    snapshot: &ConditionalBalanceAllowance,
-    required_units: &U256,
-) -> (bool, String) {
-    let available_units = snapshot.available_units();
-    let available_raw = available_units.to_string();
-    (available_units >= *required_units, available_raw)
-}
-
-async fn wait_for_post_fill_sell_availability(
-    config: &Config,
-    client: &ClobClient,
-    token_id: &str,
-    required_units: U256,
-) -> SellAvailabilityCheckResult {
-    let interval_ms = config.post_fill_sell_balance_check_interval_ms.max(1);
-    let max_retries = config.post_fill_sell_balance_check_max_retries.max(1);
-    let required_raw = required_units.to_string();
-    let started = Instant::now();
-
-    let mut poll_count = 0_u64;
-    let mut available_raw: Option<String> = None;
-    let mut balance_raw: Option<String> = None;
-    let mut allowance_raw: Option<String> = None;
-    let mut last_error: Option<String> = None;
-
-    loop {
-        poll_count += 1;
-
-        match client.get_conditional_balance_allowance(token_id).await {
-            Ok(snapshot) => {
-                let (ready, current_available_raw) =
-                    evaluate_sell_availability(&snapshot, &required_units);
-
-                balance_raw = Some(snapshot.balance_raw.clone());
-                allowance_raw = Some(snapshot.allowance_raw.clone());
-                available_raw = Some(current_available_raw.clone());
-
-                if ready {
-                    let elapsed_ms = started.elapsed().as_millis() as u64;
-                    return SellAvailabilityCheckResult {
-                        ready: true,
-                        poll_count,
-                        elapsed_ms,
-                        stop_reason: None,
-                        required_raw,
-                        available_raw,
-                        balance_raw,
-                        allowance_raw,
-                        last_error,
-                    };
-                }
-
-                if poll_count == 1 || poll_count % POST_FILL_SELL_BALANCE_CHECK_WARN_BURST == 0 {
-                    log_info(
-                        "Exit",
-                        &format!(
-                            "post-fill SELL waiting balance/allowance token={} poll#{} available={} required={} interval={}ms",
-                            token_id,
-                            poll_count,
-                            current_available_raw,
-                            required_raw,
-                            interval_ms
-                        ),
-                    );
-                }
-            }
-            Err(error) => {
-                let message = compact_error_message(&format_error_chain(&error), 180);
-                last_error = Some(message.clone());
-
-                if poll_count == 1 || poll_count % POST_FILL_SELL_BALANCE_CHECK_WARN_BURST == 0 {
-                    log_warn(
-                        "Exit",
-                        &format!(
-                            "post-fill SELL balance/allowance check failed token={} poll#{} msg={}",
-                            token_id, poll_count, message
-                        ),
-                    );
-                }
-            }
-        }
-
-        if poll_count >= max_retries {
-            let elapsed_ms = started.elapsed().as_millis() as u64;
-            return SellAvailabilityCheckResult {
-                ready: false,
-                poll_count,
-                elapsed_ms,
-                stop_reason: Some("max_retries_reached".to_owned()),
-                required_raw,
-                available_raw,
-                balance_raw,
-                allowance_raw,
-                last_error,
-            };
-        }
-
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        if elapsed_ms >= POST_FILL_SELL_BALANCE_CHECK_MAX_WAIT_MS {
-            return SellAvailabilityCheckResult {
-                ready: false,
-                poll_count,
-                elapsed_ms,
-                stop_reason: Some("max_wait_reached".to_owned()),
-                required_raw,
-                available_raw,
-                balance_raw,
-                allowance_raw,
-                last_error,
-            };
-        }
-
-        sleep_ms(interval_ms).await;
-    }
 }
 
 fn build_post_fill_sell_limit_payload(
@@ -1410,79 +1247,8 @@ async fn submit_post_fill_sell_limit(
         return payload;
     }
 
-    let required_units = match encode_amount_to_6_decimals_units("filled_size", normalized_size) {
-        Ok(value) => value,
-        Err(error) => {
-            payload.insert(
-                "status".to_owned(),
-                json!("skipped_invalid_filled_size_units"),
-            );
-            payload.insert(
-                "errorMsg".to_owned(),
-                json!(compact_error_message(&format_error_chain(&error), 180)),
-            );
-            payload.insert("errorCode".to_owned(), json!("SELL_SIZE_UNITS_INVALID"));
-            payload.insert("retryable".to_owned(), json!(false));
-            payload.insert("errorPhase".to_owned(), json!("pre_submit_balance_check"));
-            return payload;
-        }
-    };
-
-    let availability =
-        wait_for_post_fill_sell_availability(config, client, token_id, required_units).await;
-
-    payload.insert(
-        "preSubmitBalanceCheck".to_owned(),
-        build_sell_availability_payload(
-            &availability,
-            config.post_fill_sell_balance_check_interval_ms,
-            config.post_fill_sell_balance_check_max_retries,
-        ),
-    );
-
-    if !availability.ready {
-        let stop_reason = availability.stop_reason.as_deref().unwrap_or("unknown");
-
-        let fallback_msg = if let Some(last_error) = availability.last_error.as_deref() {
-            format!(
-                "balance/allowance not ready (reason={}) within {}ms; last error: {}",
-                stop_reason, availability.elapsed_ms, last_error
-            )
-        } else {
-            format!(
-                "balance/allowance not ready (reason={}) within {}ms (available={} required={})",
-                stop_reason,
-                availability.elapsed_ms,
-                availability.available_raw.as_deref().unwrap_or("unknown"),
-                availability.required_raw
-            )
-        };
-
-        payload.insert(
-            "status".to_owned(),
-            json!("skipped_balance_allowance_unavailable"),
-        );
-        payload.insert("errorMsg".to_owned(), json!(fallback_msg));
-        payload.insert(
-            "errorCode".to_owned(),
-            json!("SELL_BALANCE_ALLOWANCE_UNAVAILABLE"),
-        );
-        payload.insert("retryable".to_owned(), json!(true));
-        payload.insert("errorPhase".to_owned(), json!("pre_submit_balance_check"));
-        return payload;
-    }
-
-    log_info(
-        "Exit",
-        &format!(
-            "post-fill SELL balance/allowance ready token={} available={} required={} polls={} wait={}ms",
-            token_id,
-            availability.available_raw.as_deref().unwrap_or("unknown"),
-            availability.required_raw,
-            availability.poll_count,
-            availability.elapsed_ms
-        ),
-    );
+    let retry_interval_ms = config.post_fill_sell_retry_interval_ms.max(1);
+    let max_retries = config.post_fill_sell_max_retries.max(1);
 
     let tick_size = match client.get_tick_size(token_id).await {
         Ok(value) => value,
@@ -1504,109 +1270,193 @@ async fn submit_post_fill_sell_limit(
     let final_price = clamp_price(round_to_tick_ceil(clamp_price(requested_price), &tick_size));
     payload.insert("finalPrice".to_owned(), json!(final_price));
 
-    let signed_order = match client
-        .create_limit_order_sell(token_id, normalized_size, final_price, &tick_size)
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            let classified = classify_submit_error_message(&format_error_chain(&error));
-            payload.insert("attempted".to_owned(), json!(true));
-            payload.insert("status".to_owned(), json!("order_creation_failed"));
-            payload.insert("errorMsg".to_owned(), json!(classified.message));
-            payload.insert("errorCode".to_owned(), json!(classified.code));
-            payload.insert("retryable".to_owned(), json!(classified.retryable));
-            payload.insert("errorPhase".to_owned(), json!("order_creation"));
-            return payload;
+    let mut attempts_used = 0_u64;
+    let mut last_status = "order_submit_failed".to_owned();
+    let mut last_error_message: Option<String> = None;
+    let mut last_error_code: Option<String> = None;
+    let mut last_retryable = true;
+    let mut last_error_phase = "order_submission".to_owned();
+    let mut last_post_result: Option<Value> = None;
+
+    for attempt_idx in 1..=max_retries {
+        attempts_used = attempt_idx;
+
+        if attempt_idx > 1 {
+            sleep_ms(retry_interval_ms).await;
         }
-    };
 
-    let post_result = match client
-        .post_order(&signed_order, "GTC", false, Some(false))
-        .await
-    {
-        Ok(value) => value,
-        Err(error) => {
-            let classified = classify_submit_error_message(&format_error_chain(&error));
-            payload.insert("attempted".to_owned(), json!(true));
-            payload.insert("status".to_owned(), json!("order_submit_failed"));
-            payload.insert("errorMsg".to_owned(), json!(classified.message));
-            payload.insert("errorCode".to_owned(), json!(classified.code));
-            payload.insert("retryable".to_owned(), json!(classified.retryable));
-            payload.insert("errorPhase".to_owned(), json!("order_submission"));
-            return payload;
-        }
-    };
+        let signed_order = match client
+            .create_limit_order_sell(token_id, normalized_size, final_price, &tick_size)
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let classified = classify_submit_error_message(&format_error_chain(&error));
+                last_status = "order_creation_failed".to_owned();
+                last_error_message = Some(classified.message.clone());
+                last_error_code = Some(classified.code.clone());
+                last_retryable = classified.retryable;
+                last_error_phase = "order_creation".to_owned();
 
-    payload.insert("attempted".to_owned(), json!(true));
+                log_warn(
+                    "Exit",
+                    &format!(
+                        "post-fill SELL submit retry {}/{} failed phase=order_creation code={} msg={}",
+                        attempt_idx, max_retries, classified.code, classified.message
+                    ),
+                );
 
-    let submit_success = extract_submit_success(&post_result);
-    let submit_status = extract_submit_status(&post_result);
-    let submit_error_message = extract_submit_error_message(&post_result);
-    let submit_error_code = submit_error_message
-        .as_deref()
-        .and_then(infer_submit_error_code);
-    let submit_rejected = submit_success == Some(false) || submit_error_message.is_some();
-
-    if submit_rejected {
-        let fallback_classified = classify_submit_error_message(
-            submit_error_message
-                .as_deref()
-                .unwrap_or("order submission rejected"),
-        );
-
-        let error_code = submit_error_code
-            .clone()
-            .unwrap_or_else(|| fallback_classified.code.clone());
-
-        let retryable = if submit_error_code.is_some() {
-            !is_non_retryable_submit_error(Some(error_code.as_str()))
-        } else {
-            fallback_classified.retryable
+                continue;
+            }
         };
 
-        payload.insert(
-            "status".to_owned(),
-            json!(submit_status.as_deref().unwrap_or("order_submit_rejected")),
-        );
-        payload.insert(
-            "errorMsg".to_owned(),
-            json!(submit_error_message.unwrap_or(fallback_classified.message)),
-        );
-        payload.insert("errorCode".to_owned(), json!(error_code));
-        payload.insert("retryable".to_owned(), json!(retryable));
-        payload.insert("errorPhase".to_owned(), json!("order_submission"));
-        payload.insert("postResult".to_owned(), post_result);
-        return payload;
-    }
+        let post_result = match client
+            .post_order(&signed_order, "GTC", false, Some(false))
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let classified = classify_submit_error_message(&format_error_chain(&error));
+                last_status = "order_submit_failed".to_owned();
+                last_error_message = Some(classified.message.clone());
+                last_error_code = Some(classified.code.clone());
+                last_retryable = classified.retryable;
+                last_error_phase = "order_submission".to_owned();
 
-    let order_id = extract_order_id(&post_result);
-    if order_id.is_empty() {
-        payload.insert(
-            "status".to_owned(),
-            json!(submit_status
+                log_warn(
+                    "Exit",
+                    &format!(
+                        "post-fill SELL submit retry {}/{} failed phase=order_submission code={} msg={}",
+                        attempt_idx, max_retries, classified.code, classified.message
+                    ),
+                );
+
+                continue;
+            }
+        };
+
+        let submit_success = extract_submit_success(&post_result);
+        let submit_status = extract_submit_status(&post_result);
+        let submit_error_message = extract_submit_error_message(&post_result);
+        let submit_error_code = submit_error_message
+            .as_deref()
+            .and_then(infer_submit_error_code);
+        let submit_rejected = submit_success == Some(false) || submit_error_message.is_some();
+
+        if submit_rejected {
+            let fallback_classified = classify_submit_error_message(
+                submit_error_message
+                    .as_deref()
+                    .unwrap_or("order submission rejected"),
+            );
+
+            let error_code = submit_error_code
+                .clone()
+                .unwrap_or_else(|| fallback_classified.code.clone());
+
+            let retryable = if submit_error_code.is_some() {
+                !is_non_retryable_submit_error(Some(error_code.as_str()))
+            } else {
+                fallback_classified.retryable
+            };
+
+            let status_text = submit_status
                 .as_deref()
-                .unwrap_or("order_submit_missing_order_id")),
-        );
+                .unwrap_or("order_submit_rejected")
+                .to_owned();
+            let message_text = submit_error_message.unwrap_or(fallback_classified.message);
+
+            last_status = status_text.clone();
+            last_error_message = Some(message_text.clone());
+            last_error_code = Some(error_code.clone());
+            last_retryable = retryable;
+            last_error_phase = "order_submission".to_owned();
+            last_post_result = Some(post_result);
+
+            log_warn(
+                "Exit",
+                &format!(
+                    "post-fill SELL submit retry {}/{} rejected status={} code={} retryable={} msg={}",
+                    attempt_idx, max_retries, status_text, error_code, retryable, message_text
+                ),
+            );
+
+            continue;
+        }
+
+        let order_id = extract_order_id(&post_result);
+        if order_id.is_empty() {
+            let status_text = submit_status
+                .as_deref()
+                .unwrap_or("order_submit_missing_order_id")
+                .to_owned();
+            let message_text = submit_error_message
+                .unwrap_or_else(|| "postOrder response does not contain orderID/id".to_owned());
+
+            last_status = status_text.clone();
+            last_error_message = Some(message_text.clone());
+            last_error_code = Some("ORDER_ID_MISSING".to_owned());
+            last_retryable = true;
+            last_error_phase = "response_parse".to_owned();
+            last_post_result = Some(post_result);
+
+            log_warn(
+                "Exit",
+                &format!(
+                    "post-fill SELL submit retry {}/{} failed phase=response_parse status={} code=ORDER_ID_MISSING msg={}",
+                    attempt_idx, max_retries, status_text, message_text
+                ),
+            );
+
+            continue;
+        }
+
+        payload.insert("attempted".to_owned(), json!(true));
+        payload.insert("success".to_owned(), json!(true));
+        payload.insert("orderId".to_owned(), json!(order_id));
         payload.insert(
-            "errorMsg".to_owned(),
-            json!(submit_error_message
-                .unwrap_or_else(|| "postOrder response does not contain orderID/id".to_owned())),
+            "status".to_owned(),
+            json!(submit_status.unwrap_or_else(|| "submitted".to_owned())),
         );
-        payload.insert("errorCode".to_owned(), json!("ORDER_ID_MISSING"));
-        payload.insert("retryable".to_owned(), json!(true));
-        payload.insert("errorPhase".to_owned(), json!("response_parse"));
         payload.insert("postResult".to_owned(), post_result);
+        payload.insert("submitAttempt".to_owned(), json!(attempts_used));
+        payload.insert(
+            "submitRetry".to_owned(),
+            build_sell_submit_retry_payload(retry_interval_ms, max_retries, attempts_used, false),
+        );
+
         return payload;
     }
 
-    payload.insert("success".to_owned(), json!(true));
-    payload.insert("orderId".to_owned(), json!(order_id));
+    payload.insert("attempted".to_owned(), json!(attempts_used > 0));
     payload.insert(
         "status".to_owned(),
-        json!(submit_status.unwrap_or_else(|| "submitted".to_owned())),
+        json!(format!("{}_retries_exhausted", last_status)),
     );
-    payload.insert("postResult".to_owned(), post_result);
+    payload.insert(
+        "errorMsg".to_owned(),
+        json!(last_error_message.unwrap_or_else(|| {
+            format!(
+                "post-fill SELL retries exhausted after {} attempts",
+                attempts_used
+            )
+        })),
+    );
+    payload.insert(
+        "errorCode".to_owned(),
+        json!(last_error_code.unwrap_or_else(|| "SELL_RETRY_EXHAUSTED".to_owned())),
+    );
+    payload.insert("retryable".to_owned(), json!(last_retryable));
+    payload.insert("errorPhase".to_owned(), json!(last_error_phase));
+    payload.insert("submitAttempt".to_owned(), json!(attempts_used));
+    payload.insert(
+        "submitRetry".to_owned(),
+        build_sell_submit_retry_payload(retry_interval_ms, max_retries, attempts_used, true),
+    );
+
+    if let Some(post_result) = last_post_result {
+        payload.insert("postResult".to_owned(), post_result);
+    }
 
     payload
 }
