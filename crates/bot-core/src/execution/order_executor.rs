@@ -195,7 +195,7 @@ fn classify_submit_error_message(message: &str) -> ClassifiedSubmitError {
         };
     }
 
-    if (500_u16..=599_u16).any(|code| lower.contains(&code.to_string())) {
+    if lower.contains("http 5") || lower.contains("status 5") || lower.contains("code=5") {
         return ClassifiedSubmitError {
             message: compact,
             code: "RETRYABLE_HTTP_5XX".to_owned(),
@@ -224,6 +224,60 @@ fn classify_submit_error_message(message: &str) -> ClassifiedSubmitError {
         code: "UNKNOWN_SUBMIT_ERROR".to_owned(),
         retryable: false,
     }
+}
+
+fn parse_balance_amount_from_rejection(message: &str) -> Option<f64> {
+    let lower = message.to_lowercase();
+    let marker = "balance:";
+    let start = lower.find(marker)? + marker.len();
+    let tail = &lower[start..];
+
+    let digits: String = tail
+        .chars()
+        .skip_while(|ch| ch.is_whitespace())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+
+    if digits.is_empty() {
+        return None;
+    }
+
+    let units = digits.parse::<f64>().ok()?;
+    Some((units / 1_000_000.0).max(0.0))
+}
+
+fn floor_to_sell_size_step(value: f64) -> f64 {
+    if !value.is_finite() || value <= 0.0 {
+        return 0.0;
+    }
+
+    let step = 0.01_f64;
+    let floored = (value / step).floor() * step;
+    (floored * 100.0).round() / 100.0
+}
+
+fn apply_balance_limited_sell_size(
+    current_size: f64,
+    rejection_message: &str,
+) -> Option<(f64, f64)> {
+    if !rejection_message
+        .to_lowercase()
+        .contains("not enough balance")
+    {
+        return None;
+    }
+
+    let parsed_balance = parse_balance_amount_from_rejection(rejection_message)?;
+    let safe_size = floor_to_sell_size_step(parsed_balance - 0.01);
+
+    if safe_size <= 0.0 {
+        return None;
+    }
+    if safe_size >= current_size {
+        return None;
+    }
+
+    Some((parsed_balance, safe_size))
 }
 
 fn fallback_limit_price(config: &Config) -> f64 {
@@ -1270,6 +1324,9 @@ async fn submit_post_fill_sell_limit(
     let final_price = clamp_price(round_to_tick_ceil(clamp_price(requested_price), &tick_size));
     payload.insert("finalPrice".to_owned(), json!(final_price));
 
+    let mut current_size = normalized_size;
+    payload.insert("sizeAdjustedForBalance".to_owned(), json!(false));
+
     let mut attempts_used = 0_u64;
     let mut last_status = "order_submit_failed".to_owned();
     let mut last_error_message: Option<String> = None;
@@ -1286,7 +1343,7 @@ async fn submit_post_fill_sell_limit(
         }
 
         let signed_order = match client
-            .create_limit_order_sell(token_id, normalized_size, final_price, &tick_size)
+            .create_limit_order_sell(token_id, current_size, final_price, &tick_size)
             .await
         {
             Ok(value) => value,
@@ -1366,6 +1423,23 @@ async fn submit_post_fill_sell_limit(
                 .to_owned();
             let message_text = submit_error_message.unwrap_or(fallback_classified.message);
 
+            if let Some((parsed_balance, reduced_size)) =
+                apply_balance_limited_sell_size(current_size, &message_text)
+            {
+                current_size = reduced_size;
+                payload.insert("sizeAdjustedForBalance".to_owned(), json!(true));
+                payload.insert("adjustedSize".to_owned(), json!(current_size));
+                payload.insert("balanceAtReject".to_owned(), json!(parsed_balance));
+
+                log_warn(
+                    "Exit",
+                    &format!(
+                        "post-fill SELL submit retry {}/{} balance-limited resize parsedBalance={:.6} nextSize={:.2}",
+                        attempt_idx, max_retries, parsed_balance, current_size
+                    ),
+                );
+            }
+
             last_status = status_text.clone();
             last_error_message = Some(message_text.clone());
             last_error_code = Some(error_code.clone());
@@ -1414,6 +1488,7 @@ async fn submit_post_fill_sell_limit(
         payload.insert("attempted".to_owned(), json!(true));
         payload.insert("success".to_owned(), json!(true));
         payload.insert("orderId".to_owned(), json!(order_id));
+        payload.insert("size".to_owned(), json!(current_size));
         payload.insert(
             "status".to_owned(),
             json!(submit_status.unwrap_or_else(|| "submitted".to_owned())),
@@ -2169,6 +2244,25 @@ mod tests {
             .and_then(infer_submit_error_code);
         assert_eq!(error_code.as_deref(), Some("INVALID_ORDER_MIN_SIZE"));
         assert!(is_non_retryable_submit_error(error_code.as_deref()));
+    }
+
+    #[test]
+    fn keeps_non_retryable_code_for_balance_digits_without_http_status() {
+        let message = "not enough balance / allowance. balance: 1048840, order amount: 1050000";
+        let classified = classify_submit_error_message(message);
+
+        assert_eq!(classified.code, "NON_RETRYABLE_REQUEST");
+        assert!(!classified.retryable);
+    }
+
+    #[test]
+    fn shrinks_post_fill_sell_size_from_balance_rejection_message() {
+        let message = "not enough balance / allowance. balance: 1048840, order amount: 1050000";
+        let adjusted = apply_balance_limited_sell_size(1.05, message)
+            .expect("balance-limited adjustment should produce reduced size");
+
+        assert!((adjusted.0 - 1.04884).abs() < 0.000001);
+        assert!((adjusted.1 - 1.03).abs() < 0.000001);
     }
 
     #[test]
