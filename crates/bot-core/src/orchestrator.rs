@@ -55,6 +55,13 @@ struct PostFillSellLimitOutcome {
     error_msg: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CycleOutcome {
+    None,
+    Win,
+    Loss,
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -464,6 +471,8 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
     let mut pending_claims: HashMap<String, PendingClaim> = HashMap::new();
     let telegram = create_telegram_notifier(&config);
     let mut pause_notice_sent = false;
+    let mut losses_since_resume = 0_u64;
+    let mut paused_by_loss_limit = false;
 
     if should_manage_claims(&config) {
         if let Err(error) = restore_pending_claims_from_history(&config, &mut pending_claims).await
@@ -495,13 +504,20 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
         let _ = telegram.send(&startup_message).await;
     }
 
+    if config.total_loss_trades > 0 && !telegram.enabled {
+        log_warn(
+            "Risk",
+            "TOTAL_LOSS_TRADES is enabled but Telegram is disabled; /resume command is unavailable until restart",
+        );
+    }
+
     if config.once {
         if telegram.is_paused() {
             log_warn("BOT", "trading paused (use /resume to continue)");
             return Ok(());
         }
 
-        run_cycle(
+        let _ = run_cycle(
             &config,
             &mut processed_windows,
             &mut pending_claims,
@@ -546,9 +562,21 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
         if pause_notice_sent {
             pause_notice_sent = false;
             log_info("BOT", "trading resumed");
+
+            if paused_by_loss_limit {
+                paused_by_loss_limit = false;
+                losses_since_resume = 0;
+                log_info("Risk", "loss counter reset after /resume");
+
+                if telegram.enabled {
+                    let _ = telegram
+                        .send("[POLYMARKET BOT LOSS GUARD RESET]\nlosses   : 0\nstate    : RUNNING")
+                        .await;
+                }
+            }
         }
 
-        if let Err(error) = run_cycle(
+        match run_cycle(
             &config,
             &mut processed_windows,
             &mut pending_claims,
@@ -556,7 +584,43 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
         )
         .await
         {
-            log_warn("Cycle", &format!("cycle ended with error: {error}"));
+            Ok(CycleOutcome::Loss) => {
+                losses_since_resume = losses_since_resume.saturating_add(1);
+
+                if config.total_loss_trades > 0
+                    && losses_since_resume >= config.total_loss_trades
+                    && !telegram.is_paused()
+                {
+                    paused_by_loss_limit = true;
+
+                    let reason = format!(
+                        "loss trades reached {}/{}",
+                        losses_since_resume, config.total_loss_trades
+                    );
+                    let _ = telegram.set_paused(true, Some(&reason)).await;
+
+                    log_warn(
+                        "Risk",
+                        &format!(
+                            "loss-trade guard reached ({}/{}), trading paused until /resume",
+                            losses_since_resume, config.total_loss_trades
+                        ),
+                    );
+
+                    if telegram.enabled {
+                        let _ = telegram
+                            .send(&format!(
+                                "[POLYMARKET BOT LOSS GUARD]\nlosses   : {}/{}\nnext step: send /resume to continue",
+                                losses_since_resume, config.total_loss_trades
+                            ))
+                            .await;
+                    }
+                }
+            }
+            Ok(CycleOutcome::Win) | Ok(CycleOutcome::None) => {}
+            Err(error) => {
+                log_warn("Cycle", &format!("cycle ended with error: {error}"));
+            }
         }
 
         sleep_ms(config.idle_poll_interval_ms).await;
@@ -696,13 +760,13 @@ async fn run_cycle(
     processed_windows: &mut HashSet<u64>,
     pending_claims: &mut HashMap<String, PendingClaim>,
     telegram: &TelegramNotifier,
-) -> Result<()> {
+) -> Result<CycleOutcome> {
     let window = build_window(None);
 
     cleanup_processed_windows(processed_windows, window.window_start_sec);
 
     if processed_windows.contains(&window.window_start_sec) {
-        return Ok(());
+        return Ok(CycleOutcome::None);
     }
 
     log_cycle_separator(&window.slug);
@@ -722,7 +786,7 @@ async fn run_cycle(
             "Live trading is disabled. Execution wiring is active and waiting for LIVE mode.",
         );
         processed_windows.insert(window.window_start_sec);
-        return Ok(());
+        return Ok(CycleOutcome::None);
     }
 
     let entry_target_sec = window
@@ -745,7 +809,7 @@ async fn run_cycle(
     if now_sec() >= window.close_time_sec {
         log_warn("Cycle", "window closed before entry step");
         processed_windows.insert(window.window_start_sec);
-        return Ok(());
+        return Ok(CycleOutcome::None);
     }
 
     log_info(
@@ -764,7 +828,7 @@ async fn run_cycle(
             &format!("market not found for slug={}", window.slug),
         );
         processed_windows.insert(window.window_start_sec);
-        return Ok(());
+        return Ok(CycleOutcome::None);
     };
 
     let candidate = select_side_candidate(config, &market).await;
@@ -774,7 +838,7 @@ async fn run_cycle(
             &format!("no side candidate in configured range for {}", window.slug),
         );
         processed_windows.insert(window.window_start_sec);
-        return Ok(());
+        return Ok(CycleOutcome::None);
     };
 
     log_info(
@@ -907,7 +971,7 @@ async fn run_cycle(
                         ),
                     );
                     processed_windows.insert(window.window_start_sec);
-                    return Ok(());
+                    return Ok(CycleOutcome::None);
                 }
             };
 
@@ -1018,6 +1082,13 @@ async fn run_cycle(
                 ))
                 .await;
         }
+
+        processed_windows.insert(window.window_start_sec);
+        return Ok(if won {
+            CycleOutcome::Win
+        } else {
+            CycleOutcome::Loss
+        });
     } else {
         log_warn(
             "Entry",
@@ -1051,5 +1122,5 @@ async fn run_cycle(
 
     processed_windows.insert(window.window_start_sec);
 
-    Ok(())
+    Ok(CycleOutcome::None)
 }
