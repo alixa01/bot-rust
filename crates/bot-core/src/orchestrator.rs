@@ -473,6 +473,7 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
     let mut pause_notice_sent = false;
     let mut losses_since_resume = 0_u64;
     let mut paused_by_loss_limit = false;
+    let mut loss_cooldown_until_sec: Option<u64> = None;
 
     if should_manage_claims(&config) {
         if let Err(error) = restore_pending_claims_from_history(&config, &mut pending_claims).await
@@ -576,6 +577,23 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
             }
         }
 
+        if let Some(cooldown_until_sec) = loss_cooldown_until_sec {
+            let now = now_sec();
+            if now < cooldown_until_sec {
+                sleep_ms(2_000).await;
+                continue;
+            }
+
+            loss_cooldown_until_sec = None;
+            log_info("Risk", "loss cooldown finished, trading resumed");
+
+            if telegram.enabled {
+                let _ = telegram
+                    .send("[POLYMARKET BOT LOSS COOLDOWN END]\nstate    : RUNNING")
+                    .await;
+            }
+        }
+
         match run_cycle(
             &config,
             &mut processed_windows,
@@ -586,11 +604,13 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
         {
             Ok(CycleOutcome::Loss) => {
                 losses_since_resume = losses_since_resume.saturating_add(1);
+                let mut loss_guard_triggered = false;
 
                 if config.total_loss_trades > 0
                     && losses_since_resume >= config.total_loss_trades
                     && !telegram.is_paused()
                 {
+                    loss_guard_triggered = true;
                     paused_by_loss_limit = true;
 
                     let reason = format!(
@@ -614,6 +634,30 @@ pub async fn run_orchestrator(config: Config) -> Result<()> {
                                 losses_since_resume, config.total_loss_trades
                             ))
                             .await;
+                    }
+                }
+
+                if !loss_guard_triggered && config.loss_cooldown_minutes > 0 {
+                    let cooldown_sec = config.loss_cooldown_minutes.saturating_mul(60);
+                    if cooldown_sec > 0 {
+                        loss_cooldown_until_sec = Some(now_sec().saturating_add(cooldown_sec));
+
+                        log_info(
+                            "Risk",
+                            &format!(
+                                "loss cooldown started for {} minute(s) after losing trade",
+                                config.loss_cooldown_minutes
+                            ),
+                        );
+
+                        if telegram.enabled {
+                            let _ = telegram
+                                .send(&format!(
+                                    "[POLYMARKET BOT LOSS COOLDOWN]\nminutes  : {}\nnext step: waiting before next entry",
+                                    config.loss_cooldown_minutes
+                                ))
+                                .await;
+                        }
                     }
                 }
             }
