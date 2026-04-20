@@ -41,6 +41,12 @@ struct SideCandidate {
 }
 
 #[derive(Debug, Clone)]
+struct SideProbeResult {
+    candidate: Option<SideCandidate>,
+    best_ask: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
 struct PostFillSellLimitOutcome {
     attempted: bool,
     success: bool,
@@ -737,19 +743,27 @@ async fn fetch_side_candidate(
     config: &Config,
     side: MarketSide,
     token_id: &str,
-) -> Option<SideCandidate> {
+) -> SideProbeResult {
     if token_id.trim().is_empty() {
         log_warn(
             "Signal",
             &format!("side={} candidate missing token id", side_label(side)),
         );
-        return None;
+        return SideProbeResult {
+            candidate: None,
+            best_ask: None,
+        };
     }
 
     match fetch_orderbook_snapshot(config, token_id).await {
         Ok(orderbook) => {
+            let best_ask = (orderbook.best_ask > 0.0).then_some(orderbook.best_ask);
+
             if !orderbook.asks_present || orderbook.best_ask <= 0.0 {
-                return None;
+                return SideProbeResult {
+                    candidate: None,
+                    best_ask,
+                };
             }
 
             if let Some(reason) = buy_band_reject_reason(config, orderbook.best_ask) {
@@ -764,15 +778,21 @@ async fn fetch_side_candidate(
                         reason
                     ),
                 );
-                return None;
+                return SideProbeResult {
+                    candidate: None,
+                    best_ask,
+                };
             }
 
-            Some(SideCandidate {
-                side,
-                token_id: token_id.to_owned(),
-                ask_price: orderbook.best_ask,
-                bid_price: orderbook.best_bid,
-            })
+            SideProbeResult {
+                candidate: Some(SideCandidate {
+                    side,
+                    token_id: token_id.to_owned(),
+                    ask_price: orderbook.best_ask,
+                    bid_price: orderbook.best_bid,
+                }),
+                best_ask,
+            }
         }
         Err(error) => {
             log_warn(
@@ -784,21 +804,75 @@ async fn fetch_side_candidate(
                     error
                 ),
             );
-            None
+            SideProbeResult {
+                candidate: None,
+                best_ask: None,
+            }
         }
     }
+}
+
+fn is_within_retry_max_band(config: &Config, price: Option<f64>) -> bool {
+    matches!(price, Some(value) if value > 0.0 && value <= config.price_range_max)
 }
 
 async fn select_side_candidate(
     config: &Config,
     market: &DiscoveredMarket,
 ) -> Option<SideCandidate> {
-    let up = fetch_side_candidate(config, MarketSide::Up, &market.yes_token_id).await;
-    if up.is_some() {
-        return up;
-    }
+    let mut retries_done = 0_u64;
+    let mut allow_retry = false;
 
-    fetch_side_candidate(config, MarketSide::Down, &market.no_token_id).await
+    loop {
+        let (up, down) = tokio::join!(
+            fetch_side_candidate(config, MarketSide::Up, &market.yes_token_id),
+            fetch_side_candidate(config, MarketSide::Down, &market.no_token_id)
+        );
+
+        if let Some(candidate) = up.candidate {
+            return Some(candidate);
+        }
+
+        if let Some(candidate) = down.candidate {
+            return Some(candidate);
+        }
+
+        if retries_done == 0 {
+            allow_retry = config.entry_price_max_retries > 0
+                && is_within_retry_max_band(config, up.best_ask)
+                && is_within_retry_max_band(config, down.best_ask);
+        }
+
+        if !allow_retry || retries_done >= config.entry_price_max_retries {
+            return None;
+        }
+
+        retries_done += 1;
+
+        let up_label = up
+            .best_ask
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "n/a".to_owned());
+        let down_label = down
+            .best_ask
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "n/a".to_owned());
+
+        log_info(
+            "Signal",
+            &format!(
+                "entry price retry {}/{} in {}ms (upBestAsk={} downBestAsk={} max={:.2})",
+                retries_done,
+                config.entry_price_max_retries,
+                config.entry_price_retry_interval_ms,
+                up_label,
+                down_label,
+                config.price_range_max,
+            ),
+        );
+
+        sleep_ms(config.entry_price_retry_interval_ms).await;
+    }
 }
 
 async fn run_cycle(

@@ -261,6 +261,8 @@ pub struct Config {
     pub price_range_min: f64,
     pub price_range_max: f64,
     pub entry_price_gate_enabled: bool,
+    pub entry_price_retry_interval_ms: u64,
+    pub entry_price_max_retries: u64,
     pub entry_slippage_percent_buy: f64,
     pub enable_fallback_gtc_limit: bool,
     pub enable_post_fill_sell_limit: bool,

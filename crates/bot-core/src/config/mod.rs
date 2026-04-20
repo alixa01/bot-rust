@@ -182,6 +182,8 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     let price_range_min = number_env("PRICE_RANGE_MIN", 0.75)?;
     let price_range_max = number_env("PRICE_RANGE_MAX", 0.95)?;
     let entry_price_gate_enabled = boolean_env("ENABLE_ENTRY_PRICE_GATE", true)?;
+    let entry_price_retry_interval_ms = floor_u64_env("ENTRY_PRICE_RETRY_INTERVAL_MS", 300.0)?;
+    let entry_price_max_retries = floor_u64_env("ENTRY_PRICE_MAX_RETRIES", 0.0)?;
     let entry_slippage_percent_buy = number_env("ENTRY_SLIPPAGE_PERCENT_BUY", 1.5)?;
     let enable_fallback_gtc_limit = boolean_env("ENABLE_FALLBACK_GTC_LIMIT", false)?;
     let enable_post_fill_sell_limit = boolean_env("ENABLE_POST_FILL_SELL_LIMIT", false)?;
@@ -323,6 +325,9 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     if entry_slippage_percent_buy < 0.0 {
         bail!("ENTRY_SLIPPAGE_PERCENT_BUY must be >= 0");
     }
+    if entry_price_max_retries > 0 && entry_price_retry_interval_ms == 0 {
+        bail!("ENTRY_PRICE_RETRY_INTERVAL_MS must be > 0 when ENTRY_PRICE_MAX_RETRIES > 0");
+    }
     if !(0.01..=0.99).contains(&post_fill_sell_limit_price) {
         bail!("POST_FILL_SELL_LIMIT_PRICE must be between 0.01 and 0.99");
     }
@@ -425,6 +430,8 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
         price_range_min,
         price_range_max,
         entry_price_gate_enabled,
+        entry_price_retry_interval_ms,
+        entry_price_max_retries,
         entry_slippage_percent_buy,
         enable_fallback_gtc_limit,
         enable_post_fill_sell_limit,

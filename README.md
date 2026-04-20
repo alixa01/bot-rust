@@ -56,6 +56,10 @@ npm install
 
 - `ENTRY_SLIPPAGE_PERCENT_BUY`:
   Controls BUY worst-price escalation percent component. Runtime combines this with an aggressive fixed markup floor and caps by configured max-buy bound.
+- `ENTRY_PRICE_MAX_RETRIES`:
+  Number of extra price-check attempts after the first check when both UP and DOWN best ask are at or below `PRICE_RANGE_MAX` but still fail entry gate.
+- `ENTRY_PRICE_RETRY_INTERVAL_MS`:
+  Delay in milliseconds between the retry attempts controlled by `ENTRY_PRICE_MAX_RETRIES`.
 - `ENABLE_POST_FILL_SELL_LIMIT`:
   If `true`, bot immediately places a SELL limit order after BUY is `FILLED` or `PARTIAL`.
 - `POST_FILL_SELL_LIMIT_PRICE`:

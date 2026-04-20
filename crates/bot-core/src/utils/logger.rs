@@ -6,7 +6,7 @@ fn now_tag() -> String {
     let wib = FixedOffset::east_opt(7 * 60 * 60).expect("valid fixed offset");
     Utc::now()
         .with_timezone(&wib)
-        .format("%Y-%m-%d %H:%M:%S WIB")
+        .format("%Y-%m-%d %H:%M:%S%.3f WIB")
         .to_string()
 }
 
