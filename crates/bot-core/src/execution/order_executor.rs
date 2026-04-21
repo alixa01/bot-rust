@@ -102,22 +102,6 @@ fn round_to_tick_ceil(price: f64, tick_size: &str) -> f64 {
     (rounded * factor).round() / factor
 }
 
-fn round_to_tick_floor(price: f64, tick_size: &str) -> f64 {
-    let tick = tick_size.trim().parse::<f64>().unwrap_or(0.0);
-    if !tick.is_finite() || tick <= 0.0 {
-        return price;
-    }
-
-    let rounded = (price / tick).floor() * tick;
-    let decimals = tick_size
-        .split('.')
-        .nth(1)
-        .map(|value| value.len())
-        .unwrap_or(0);
-    let factor = 10_f64.powi(decimals as i32);
-    (rounded * factor).round() / factor
-}
-
 fn apply_buy_slippage(base_price: f64, slippage_percent: f64, max_price: f64) -> f64 {
     const FIXED_MARKUP: f64 = 0.17;
 
@@ -1270,21 +1254,17 @@ fn build_sell_submit_retry_payload(
     Value::Object(payload)
 }
 
-fn build_stop_loss_payload(
+fn build_post_fill_sell_limit_payload(
     token_id: &str,
-    trigger_price: f64,
+    requested_price: f64,
     size: f64,
-    close_time_sec: u64,
-    order_type: &str,
 ) -> Map<String, Value> {
     let mut payload = Map::new();
     payload.insert("enabled".to_owned(), json!(true));
-    payload.insert("triggered".to_owned(), json!(false));
     payload.insert("attempted".to_owned(), json!(false));
-    payload.insert("orderType".to_owned(), json!(order_type));
+    payload.insert("orderType".to_owned(), json!("GTC"));
     payload.insert("tokenId".to_owned(), json!(token_id));
-    payload.insert("triggerPrice".to_owned(), json!(trigger_price));
-    payload.insert("requestedPrice".to_owned(), Value::Null);
+    payload.insert("requestedPrice".to_owned(), json!(requested_price));
     payload.insert("finalPrice".to_owned(), Value::Null);
     payload.insert("tickSize".to_owned(), Value::Null);
     payload.insert("size".to_owned(), json!(size));
@@ -1295,174 +1275,34 @@ fn build_stop_loss_payload(
     payload.insert("errorCode".to_owned(), Value::Null);
     payload.insert("retryable".to_owned(), Value::Null);
     payload.insert("errorPhase".to_owned(), Value::Null);
-    payload.insert("triggerPollCount".to_owned(), json!(0));
-    payload.insert("triggerOrderbookErrors".to_owned(), json!(0));
-    payload.insert("triggerLastBestBid".to_owned(), Value::Null);
-    payload.insert("triggerHitAtSec".to_owned(), Value::Null);
-    payload.insert("triggerStartedAtSec".to_owned(), json!(now_sec()));
-    payload.insert("triggerElapsedMs".to_owned(), json!(0));
-    payload.insert("triggerTimeoutSec".to_owned(), Value::Null);
-    payload.insert("triggerIntervalMs".to_owned(), Value::Null);
-    payload.insert(
-        "triggerDeadlineBeforeCloseSec".to_owned(),
-        Value::Null,
-    );
-    payload.insert("triggerTimeoutReached".to_owned(), json!(false));
-    payload.insert("triggerCloseDeadlineReached".to_owned(), json!(false));
-    payload.insert("closeTimeSec".to_owned(), json!(close_time_sec));
 
     payload
 }
 
-async fn submit_stop_loss_sell(
+async fn submit_post_fill_sell_limit(
     config: &Config,
     client: &ClobClient,
     token_id: &str,
     size: f64,
-    close_time_sec: u64,
 ) -> Map<String, Value> {
-    let trigger_price = config.stop_loss_price_trigger;
-    let order_type = config.stop_loss_order_type.to_uppercase();
+    let requested_price = config.post_fill_sell_limit_price;
     let normalized_size = round_size_to_6_decimals(size);
-    let mut payload = build_stop_loss_payload(
-        token_id,
-        trigger_price,
-        normalized_size,
-        close_time_sec,
-        &order_type,
-    );
-    payload.insert(
-        "triggerTimeoutSec".to_owned(),
-        json!(config.stop_loss_timeout_sec),
-    );
-    payload.insert(
-        "triggerIntervalMs".to_owned(),
-        json!(config.interval_check_price_trigger_ms),
-    );
-    payload.insert(
-        "triggerDeadlineBeforeCloseSec".to_owned(),
-        json!(config.stop_loss_deadline_before_close_sec),
-    );
+    let mut payload =
+        build_post_fill_sell_limit_payload(token_id, requested_price, normalized_size);
 
     if normalized_size <= 0.0 {
         payload.insert("status".to_owned(), json!("skipped_no_filled_size"));
         payload.insert(
             "errorMsg".to_owned(),
-            json!("filled size must be > 0 to place stop-loss SELL"),
+            json!("filled size must be > 0 to place post-fill sell limit"),
         );
         payload.insert("errorCode".to_owned(), json!("SELL_SIZE_INVALID"));
         payload.insert("retryable".to_owned(), json!(false));
         return payload;
     }
 
-    let trigger_started_at_sec = now_sec();
-    let trigger_timeout_deadline_sec =
-        trigger_started_at_sec.saturating_add(config.stop_loss_timeout_sec);
-    let close_deadline_sec = close_time_sec
-        .saturating_sub(config.stop_loss_deadline_before_close_sec);
-
-    if now_sec() >= close_deadline_sec {
-        payload.insert("status".to_owned(), json!("skipped_close_deadline"));
-        payload.insert(
-            "errorMsg".to_owned(),
-            json!("stop-loss skipped because resolve deadline is too close"),
-        );
-        payload.insert("errorCode".to_owned(), json!("STOP_LOSS_CLOSE_DEADLINE"));
-        payload.insert("retryable".to_owned(), json!(false));
-        payload.insert("triggerCloseDeadlineReached".to_owned(), json!(true));
-        return payload;
-    }
-
-    let trigger_deadline_sec = trigger_timeout_deadline_sec.min(close_deadline_sec);
-    let trigger_interval_ms = config.interval_check_price_trigger_ms.max(1);
-
-    let mut trigger_poll_count = 0_u64;
-    let mut trigger_error_count = 0_u64;
-    let mut triggered = false;
-    let mut last_best_bid: Option<f64> = None;
-
-    while now_sec() <= trigger_deadline_sec {
-        trigger_poll_count += 1;
-
-        match fetch_orderbook_snapshot(config, token_id).await {
-            Ok(orderbook) => {
-                let observed_bid = if orderbook.best_bid.is_finite() {
-                    orderbook.best_bid.max(0.0)
-                } else {
-                    0.0
-                };
-                payload.insert("triggerLastBestBid".to_owned(), json!(observed_bid));
-
-                if observed_bid > 0.0 {
-                    last_best_bid = Some(observed_bid);
-                }
-
-                if observed_bid > 0.0 && observed_bid <= trigger_price {
-                    triggered = true;
-                    let hit_at = now_sec();
-                    payload.insert("triggered".to_owned(), json!(true));
-                    payload.insert("triggerHitAtSec".to_owned(), json!(hit_at));
-
-                    log_info(
-                        "Exit",
-                        &format!(
-                            "stop-loss trigger hit token={} bestBid={:.3} trigger={:.3}",
-                            token_id, observed_bid, trigger_price
-                        ),
-                    );
-                    break;
-                }
-            }
-            Err(error) => {
-                trigger_error_count += 1;
-                if trigger_error_count <= 3 || trigger_error_count % 5 == 0 {
-                    log_warn(
-                        "Exit",
-                        &format!(
-                            "stop-loss trigger poll {}/? orderbook fetch failed: {}",
-                            trigger_poll_count,
-                            compact_error_message(&format_error_chain(&error), 180)
-                        ),
-                    );
-                }
-            }
-        }
-
-        if now_sec() >= trigger_deadline_sec {
-            break;
-        }
-
-        sleep_ms(trigger_interval_ms).await;
-    }
-
-    let trigger_elapsed_ms = now_sec()
-        .saturating_sub(trigger_started_at_sec)
-        .saturating_mul(1_000);
-    payload.insert("triggerPollCount".to_owned(), json!(trigger_poll_count));
-    payload.insert("triggerOrderbookErrors".to_owned(), json!(trigger_error_count));
-    payload.insert("triggerElapsedMs".to_owned(), json!(trigger_elapsed_ms));
-
-    if !triggered {
-        let timeout_reached = now_sec() >= trigger_timeout_deadline_sec;
-        let close_deadline_reached = now_sec() >= close_deadline_sec;
-
-        payload.insert("status".to_owned(), json!("trigger_not_hit"));
-        payload.insert("errorCode".to_owned(), json!("STOP_LOSS_TRIGGER_NOT_HIT"));
-        payload.insert(
-            "errorMsg".to_owned(),
-            json!("stop-loss trigger was not reached before deadline"),
-        );
-        payload.insert("retryable".to_owned(), json!(false));
-        payload.insert("triggerTimeoutReached".to_owned(), json!(timeout_reached));
-        payload.insert(
-            "triggerCloseDeadlineReached".to_owned(),
-            json!(close_deadline_reached),
-        );
-        return payload;
-    }
-
-    let retry_interval_ms = config.stop_loss_submit_retry_interval_ms.max(1);
-    let max_retries = config.retry_sell.max(1);
+    let retry_interval_ms = config.post_fill_sell_retry_interval_ms.max(1);
+    let max_retries = config.post_fill_sell_max_retries.max(1);
 
     let tick_size = match client.get_tick_size(token_id).await {
         Ok(value) => value,
@@ -1471,7 +1311,7 @@ async fn submit_stop_loss_sell(
             log_warn(
                 "Exit",
                 &format!(
-                    "stop-loss SELL tick size fetch failed, fallback to 0.01: {}",
+                    "post-fill SELL tick size fetch failed, fallback to 0.01: {}",
                     message
                 ),
             );
@@ -1481,10 +1321,7 @@ async fn submit_stop_loss_sell(
 
     payload.insert("tickSize".to_owned(), json!(tick_size.clone()));
 
-    let observed_bid = last_best_bid.unwrap_or(trigger_price);
-    let requested_price = observed_bid.min(trigger_price);
-    let final_price = clamp_price(round_to_tick_floor(requested_price, &tick_size));
-    payload.insert("requestedPrice".to_owned(), json!(requested_price));
+    let final_price = clamp_price(round_to_tick_ceil(clamp_price(requested_price), &tick_size));
     payload.insert("finalPrice".to_owned(), json!(final_price));
 
     let mut current_size = normalized_size;
@@ -1505,17 +1342,10 @@ async fn submit_stop_loss_sell(
             sleep_ms(retry_interval_ms).await;
         }
 
-        let signed_order = if order_type == "FOK" {
-            client
-                .create_market_order_sell(token_id, current_size, final_price, &tick_size)
-                .await
-        } else {
-            client
-                .create_limit_order_sell(token_id, current_size, final_price, &tick_size)
-                .await
-        };
-
-        let signed_order = match signed_order {
+        let signed_order = match client
+            .create_limit_order_sell(token_id, current_size, final_price, &tick_size)
+            .await
+        {
             Ok(value) => value,
             Err(error) => {
                 let classified = classify_submit_error_message(&format_error_chain(&error));
@@ -1528,7 +1358,7 @@ async fn submit_stop_loss_sell(
                 log_warn(
                     "Exit",
                     &format!(
-                        "stop-loss SELL submit retry {}/{} failed phase=order_creation code={} msg={}",
+                        "post-fill SELL submit retry {}/{} failed phase=order_creation code={} msg={}",
                         attempt_idx, max_retries, classified.code, classified.message
                     ),
                 );
@@ -1537,13 +1367,8 @@ async fn submit_stop_loss_sell(
             }
         };
 
-        let post_only = if order_type == "GTC" {
-            Some(false)
-        } else {
-            None
-        };
         let post_result = match client
-            .post_order(&signed_order, &order_type, false, post_only)
+            .post_order(&signed_order, "GTC", false, Some(false))
             .await
         {
             Ok(value) => value,
@@ -1558,7 +1383,7 @@ async fn submit_stop_loss_sell(
                 log_warn(
                     "Exit",
                     &format!(
-                        "stop-loss SELL submit retry {}/{} failed phase=order_submission code={} msg={}",
+                        "post-fill SELL submit retry {}/{} failed phase=order_submission code={} msg={}",
                         attempt_idx, max_retries, classified.code, classified.message
                     ),
                 );
@@ -1609,7 +1434,7 @@ async fn submit_stop_loss_sell(
                 log_warn(
                     "Exit",
                     &format!(
-                        "stop-loss SELL submit retry {}/{} balance-limited resize parsedBalance={:.6} nextSize={:.2}",
+                        "post-fill SELL submit retry {}/{} balance-limited resize parsedBalance={:.6} nextSize={:.2}",
                         attempt_idx, max_retries, parsed_balance, current_size
                     ),
                 );
@@ -1625,7 +1450,7 @@ async fn submit_stop_loss_sell(
             log_warn(
                 "Exit",
                 &format!(
-                    "stop-loss SELL submit retry {}/{} rejected status={} code={} retryable={} msg={}",
+                    "post-fill SELL submit retry {}/{} rejected status={} code={} retryable={} msg={}",
                     attempt_idx, max_retries, status_text, error_code, retryable, message_text
                 ),
             );
@@ -1652,7 +1477,7 @@ async fn submit_stop_loss_sell(
             log_warn(
                 "Exit",
                 &format!(
-                    "stop-loss SELL submit retry {}/{} failed phase=response_parse status={} code=ORDER_ID_MISSING msg={}",
+                    "post-fill SELL submit retry {}/{} failed phase=response_parse status={} code=ORDER_ID_MISSING msg={}",
                     attempt_idx, max_retries, status_text, message_text
                 ),
             );
@@ -1687,7 +1512,7 @@ async fn submit_stop_loss_sell(
         "errorMsg".to_owned(),
         json!(last_error_message.unwrap_or_else(|| {
             format!(
-                "stop-loss SELL retries exhausted after {} attempts",
+                "post-fill SELL retries exhausted after {} attempts",
                 attempts_used
             )
         })),
@@ -1711,19 +1536,18 @@ async fn submit_stop_loss_sell(
     payload
 }
 
-async fn attach_stop_loss_sell(
+async fn attach_post_fill_sell_limit(
     config: &Config,
     client: &ClobClient,
     token_id: &str,
     result: ExecutionResult,
     attempt: u64,
-    close_time_sec: u64,
 ) -> ExecutionResult {
-    if !config.enable_stop_loss {
+    if !config.enable_post_fill_sell_limit {
         return result;
     }
 
-    let placement = submit_stop_loss_sell(config, client, token_id, result.filled_size, close_time_sec).await;
+    let placement = submit_post_fill_sell_limit(config, client, token_id, result.filled_size).await;
 
     let success = placement
         .get("success")
@@ -1752,7 +1576,7 @@ async fn attach_stop_loss_sell(
         log_info(
             "Exit",
             &format!(
-                "attempt #{} stop-loss SELL accepted order={} size={:.6} price={:.3} status={}",
+                "attempt #{} post-fill SELL accepted order={} size={:.6} price={:.3} status={}",
                 attempt, order_id, size, price, status
             ),
         );
@@ -1777,7 +1601,7 @@ async fn attach_stop_loss_sell(
         log_warn(
             "Exit",
             &format!(
-                "attempt #{} stop-loss SELL failed phase={} code={} status={} msg={}",
+                "attempt #{} post-fill SELL failed phase={} code={} status={} msg={}",
                 attempt, phase, code, status, message
             ),
         );
@@ -1789,12 +1613,12 @@ async fn attach_stop_loss_sell(
 
         log_warn(
             "Exit",
-            &format!("attempt #{} stop-loss SELL skipped: {}", attempt, message),
+            &format!("attempt #{} post-fill SELL skipped: {}", attempt, message),
         );
     }
 
     let mut raw_response = result.raw_response.clone();
-    raw_response.insert("stopLoss".to_owned(), Value::Object(placement));
+    raw_response.insert("postFillSellLimit".to_owned(), Value::Object(placement));
 
     ExecutionResult {
         raw_response,
@@ -2145,13 +1969,8 @@ pub async fn execute_live_entry(
                 if value.status == ExecutionStatus::Filled
                     || value.status == ExecutionStatus::Partial
                 {
-                    return Ok(attach_stop_loss_sell(
-                        config,
-                        &client,
-                        token_id,
-                        value,
-                        attempt,
-                        close_time_sec,
+                    return Ok(attach_post_fill_sell_limit(
+                        config, &client, token_id, value, attempt,
                     )
                     .await);
                 }
@@ -2236,13 +2055,8 @@ pub async fn execute_live_entry(
                 if value.status == ExecutionStatus::Filled
                     || value.status == ExecutionStatus::Partial
                 {
-                    return Ok(attach_stop_loss_sell(
-                        config,
-                        &client,
-                        token_id,
-                        value,
-                        attempt,
-                        close_time_sec,
+                    return Ok(attach_post_fill_sell_limit(
+                        config, &client, token_id, value, attempt,
                     )
                     .await);
                 }

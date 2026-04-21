@@ -132,14 +132,6 @@ fn signature_type_env() -> Result<SignatureType> {
     }
 }
 
-fn stop_loss_order_type_env() -> Result<String> {
-    let raw = optional_env("STOP_LOSS_ORDER_TYPE", "GTC").to_uppercase();
-    match raw.as_str() {
-        "GTC" | "FOK" => Ok(raw),
-        _ => bail!("STOP_LOSS_ORDER_TYPE must be GTC or FOK, got: {raw}"),
-    }
-}
-
 fn normalize_private_key(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with("0x") {
@@ -194,16 +186,11 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     let entry_price_max_retries = floor_u64_env("ENTRY_PRICE_MAX_RETRIES", 0.0)?;
     let entry_slippage_percent_buy = number_env("ENTRY_SLIPPAGE_PERCENT_BUY", 1.5)?;
     let enable_fallback_gtc_limit = boolean_env("ENABLE_FALLBACK_GTC_LIMIT", false)?;
-    let enable_stop_loss = boolean_env("ENABLE_STOP_LOSS", false)?;
-    let stop_loss_price_trigger = number_env("STOP_LOSS_PRICE_TRIGGER", 0.35)?;
-    let interval_check_price_trigger_ms = floor_u64_env("INTERVAL_CHECK_PRICE_TRIGGER", 500.0)?;
-    let retry_sell = floor_u64_env("RETRY_SELL", 4.0)?;
-    let stop_loss_timeout_sec = floor_u64_env("STOP_LOSS_TIMEOUT_SECONDS", 120.0)?;
-    let stop_loss_order_type = stop_loss_order_type_env()?;
-    let stop_loss_submit_retry_interval_ms =
-        floor_u64_env("STOP_LOSS_SUBMIT_RETRY_INTERVAL_MS", 1000.0)?;
-    let stop_loss_deadline_before_close_sec =
-        floor_u64_env("STOP_LOSS_DEADLINE_BEFORE_CLOSE_SECONDS", 5.0)?;
+    let enable_post_fill_sell_limit = boolean_env("ENABLE_POST_FILL_SELL_LIMIT", false)?;
+    let post_fill_sell_limit_price = number_env("POST_FILL_SELL_LIMIT_PRICE", 0.85)?;
+    let post_fill_sell_retry_interval_ms =
+        floor_u64_env("POST_FILL_SELL_RETRY_INTERVAL_MS", 400.0)?;
+    let post_fill_sell_max_retries = floor_u64_env("POST_FILL_SELL_MAX_RETRIES", 75.0)?;
 
     let check_before_close_sec = floor_u64_env("CHECK_BEFORE_CLOSE_SECONDS", 10.0)?;
     let resolve_delay_sec = floor_u64_env("RESOLVE_DELAY_SECONDS", 2.0)?;
@@ -341,23 +328,14 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
     if entry_price_max_retries > 0 && entry_price_retry_interval_ms == 0 {
         bail!("ENTRY_PRICE_RETRY_INTERVAL_MS must be > 0 when ENTRY_PRICE_MAX_RETRIES > 0");
     }
-    if !(0.01..=0.99).contains(&stop_loss_price_trigger) {
-        bail!("STOP_LOSS_PRICE_TRIGGER must be between 0.01 and 0.99");
+    if !(0.01..=0.99).contains(&post_fill_sell_limit_price) {
+        bail!("POST_FILL_SELL_LIMIT_PRICE must be between 0.01 and 0.99");
     }
-    if interval_check_price_trigger_ms == 0 {
-        bail!("INTERVAL_CHECK_PRICE_TRIGGER must be > 0");
+    if post_fill_sell_retry_interval_ms == 0 {
+        bail!("POST_FILL_SELL_RETRY_INTERVAL_MS must be > 0");
     }
-    if retry_sell == 0 {
-        bail!("RETRY_SELL must be > 0");
-    }
-    if stop_loss_timeout_sec == 0 {
-        bail!("STOP_LOSS_TIMEOUT_SECONDS must be > 0");
-    }
-    if stop_loss_submit_retry_interval_ms == 0 {
-        bail!("STOP_LOSS_SUBMIT_RETRY_INTERVAL_MS must be > 0");
-    }
-    if stop_loss_deadline_before_close_sec == 0 {
-        bail!("STOP_LOSS_DEADLINE_BEFORE_CLOSE_SECONDS must be > 0");
+    if post_fill_sell_max_retries == 0 {
+        bail!("POST_FILL_SELL_MAX_RETRIES must be > 0");
     }
     if check_before_close_sec == 0 {
         bail!("CHECK_BEFORE_CLOSE_SECONDS must be > 0");
@@ -456,14 +434,10 @@ pub fn load_config(argv: &[String], root_dir: &Path) -> Result<Config> {
         entry_price_max_retries,
         entry_slippage_percent_buy,
         enable_fallback_gtc_limit,
-        enable_stop_loss,
-        stop_loss_price_trigger,
-        interval_check_price_trigger_ms,
-        retry_sell,
-        stop_loss_timeout_sec,
-        stop_loss_order_type,
-        stop_loss_submit_retry_interval_ms,
-        stop_loss_deadline_before_close_sec,
+        enable_post_fill_sell_limit,
+        post_fill_sell_limit_price,
+        post_fill_sell_retry_interval_ms,
+        post_fill_sell_max_retries,
         check_before_close_sec,
         resolve_delay_sec,
         idle_poll_interval_ms,

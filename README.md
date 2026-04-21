@@ -60,22 +60,14 @@ npm install
   Number of extra price-check attempts after the first check when both UP and DOWN best ask are at or below `PRICE_RANGE_MAX` but still fail entry gate.
 - `ENTRY_PRICE_RETRY_INTERVAL_MS`:
   Delay in milliseconds between the retry attempts controlled by `ENTRY_PRICE_MAX_RETRIES`.
-- `ENABLE_STOP_LOSS`:
-  If `true`, bot waits for stop-loss trigger after BUY is `FILLED` or `PARTIAL`, then places SELL.
-- `STOP_LOSS_PRICE_TRIGGER`:
-  Stop-loss trigger threshold based on Polymarket best bid. Trigger fires when `best_bid <= trigger`.
-- `INTERVAL_CHECK_PRICE_TRIGGER`:
-  Poll interval (milliseconds) for checking orderbook best bid during stop-loss wait loop.
-- `RETRY_SELL`:
-  Maximum SELL submit attempts after trigger hit.
-- `STOP_LOSS_TIMEOUT_SECONDS`:
-  Maximum wait time for trigger before SELL is skipped.
-- `STOP_LOSS_ORDER_TYPE`:
-  SELL order type after trigger (`GTC` or `FOK`).
-- `STOP_LOSS_SUBMIT_RETRY_INTERVAL_MS`:
-  Retry interval (milliseconds) between SELL submit attempts.
-- `STOP_LOSS_DEADLINE_BEFORE_CLOSE_SECONDS`:
-  Safety guard: skip stop-loss when too close to market close.
+- `ENABLE_POST_FILL_SELL_LIMIT`:
+  If `true`, bot immediately places a SELL limit order after BUY is `FILLED` or `PARTIAL`.
+- `POST_FILL_SELL_LIMIT_PRICE`:
+  Absolute SELL limit price used for post-fill exit placement. Valid range: `0.01` to `0.99`.
+- `POST_FILL_SELL_RETRY_INTERVAL_MS`:
+  Retry interval (milliseconds) between post-fill SELL submit attempts.
+- `POST_FILL_SELL_MAX_RETRIES`:
+  Maximum number of post-fill SELL submit attempts before SELL is cancelled (skipped) with diagnostics.
 
 ## Run
 

@@ -385,33 +385,6 @@ impl ClobClient {
         .await
     }
 
-    pub async fn create_market_order_sell(
-        &self,
-        token_id: &str,
-        size_shares: f64,
-        price: f64,
-        tick_size: &str,
-    ) -> Result<SignedOrder> {
-        let round = round_config_for_tick(tick_size)?;
-        let fee_rate_bps = self.get_fee_rate_bps(token_id).await?;
-        let neg_risk = self.get_neg_risk(token_id).await?;
-
-        let (side, raw_maker_amount, raw_taker_amount) =
-            get_market_order_raw_amounts(OrderSide::Sell, size_shares, price, round)?;
-
-        self.create_signed_order(SignOrderParams {
-            token_id,
-            side,
-            raw_maker_amount,
-            raw_taker_amount,
-            fee_rate_bps,
-            expiration: 0,
-            nonce: 0,
-            neg_risk,
-        })
-        .await
-    }
-
     pub async fn create_limit_order_buy(
         &self,
         token_id: &str,
