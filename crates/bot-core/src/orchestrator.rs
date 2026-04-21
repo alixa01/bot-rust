@@ -47,7 +47,7 @@ struct SideProbeResult {
 }
 
 #[derive(Debug, Clone)]
-struct PostFillSellLimitOutcome {
+struct StopLossOutcome {
     attempted: bool,
     success: bool,
     order_type: String,
@@ -114,10 +114,13 @@ fn parse_value_f64(value: Option<&Value>) -> Option<f64> {
     }
 }
 
-fn parse_post_fill_sell_limit_outcome(
+fn parse_stop_loss_outcome(
     raw_response: &HashMap<String, Value>,
-) -> Option<PostFillSellLimitOutcome> {
-    let placement = raw_response.get("postFillSellLimit")?.as_object()?;
+) -> Option<StopLossOutcome> {
+    let placement = raw_response
+        .get("stopLoss")
+        .or_else(|| raw_response.get("postFillSellLimit"))?
+        .as_object()?;
     if placement.get("enabled").and_then(Value::as_bool) != Some(true) {
         return None;
     }
@@ -131,7 +134,7 @@ fn parse_post_fill_sell_limit_outcome(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    Some(PostFillSellLimitOutcome {
+    Some(StopLossOutcome {
         attempted,
         success,
         order_type: placement
@@ -1011,7 +1014,7 @@ async fn run_cycle(
                 .await;
         }
 
-        if let Some(outcome) = parse_post_fill_sell_limit_outcome(&execution.raw_response) {
+        if let Some(outcome) = parse_stop_loss_outcome(&execution.raw_response) {
             if telegram.enabled {
                 let title = if outcome.success {
                     "[POLYMARKET BOT EXIT ORDER OK]"
