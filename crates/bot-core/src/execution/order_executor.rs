@@ -1542,9 +1542,27 @@ async fn attach_post_fill_sell_limit(
     token_id: &str,
     result: ExecutionResult,
     attempt: u64,
+    close_time_sec: u64,
 ) -> ExecutionResult {
     if !config.enable_post_fill_sell_limit {
         return result;
+    }
+
+    let trigger_before_close_sec = config.post_fill_sell_trigger_before_close_sec;
+    if trigger_before_close_sec > 0 {
+        let trigger_at_sec = close_time_sec.saturating_sub(trigger_before_close_sec);
+        let now = now_sec();
+        if now < trigger_at_sec {
+            let wait_sec = trigger_at_sec.saturating_sub(now);
+            log_info(
+                "Exit",
+                &format!(
+                    "attempt #{} post-fill SELL scheduled at t-{}s; waiting {}s",
+                    attempt, trigger_before_close_sec, wait_sec
+                ),
+            );
+            sleep_ms(wait_sec.saturating_mul(1_000)).await;
+        }
     }
 
     let placement = submit_post_fill_sell_limit(config, client, token_id, result.filled_size).await;
@@ -1970,7 +1988,12 @@ pub async fn execute_live_entry(
                     || value.status == ExecutionStatus::Partial
                 {
                     return Ok(attach_post_fill_sell_limit(
-                        config, &client, token_id, value, attempt,
+                        config,
+                        &client,
+                        token_id,
+                        value,
+                        attempt,
+                        close_time_sec,
                     )
                     .await);
                 }
@@ -2056,7 +2079,12 @@ pub async fn execute_live_entry(
                     || value.status == ExecutionStatus::Partial
                 {
                     return Ok(attach_post_fill_sell_limit(
-                        config, &client, token_id, value, attempt,
+                        config,
+                        &client,
+                        token_id,
+                        value,
+                        attempt,
+                        close_time_sec,
                     )
                     .await);
                 }
