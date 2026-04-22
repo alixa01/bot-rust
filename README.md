@@ -68,6 +68,8 @@ npm install
   Retry interval (milliseconds) between post-fill SELL submit attempts.
 - `POST_FILL_SELL_MAX_RETRIES`:
   Maximum number of post-fill SELL submit attempts before SELL is cancelled (skipped) with diagnostics.
+- `POST_FILL_SELL_PERCENT_AMOUNT`:
+  Fraction of filled position to sell via post-fill SELL limit. Example: `0.5` means sell `50%` of filled size. Valid range: `> 0` and `<= 1.0`.
 - `POST_FILL_SELL_TRIGGER_BEFORE_CLOSE_SECONDS`:
   Delays post-fill SELL placement until `t-N` before market close. Example: `8` means SELL starts at `t-8s`. Use `0` for immediate placement after fill.
 

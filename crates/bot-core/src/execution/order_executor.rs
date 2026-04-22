@@ -1286,15 +1286,23 @@ async fn submit_post_fill_sell_limit(
     size: f64,
 ) -> Map<String, Value> {
     let requested_price = config.post_fill_sell_limit_price;
-    let normalized_size = round_size_to_6_decimals(size);
+    let percent_amount = config.post_fill_sell_percent_amount;
+    let sized_from_percent = size * percent_amount;
+    let normalized_size = round_size_to_6_decimals(sized_from_percent);
     let mut payload =
         build_post_fill_sell_limit_payload(token_id, requested_price, normalized_size);
+    payload.insert("filledSize".to_owned(), json!(size));
+    payload.insert("sellPercentAmount".to_owned(), json!(percent_amount));
+    payload.insert(
+        "requestedSizeFromPercent".to_owned(),
+        json!(sized_from_percent),
+    );
 
     if normalized_size <= 0.0 {
         payload.insert("status".to_owned(), json!("skipped_no_filled_size"));
         payload.insert(
             "errorMsg".to_owned(),
-            json!("filled size must be > 0 to place post-fill sell limit"),
+            json!("computed sell size must be > 0 after applying POST_FILL_SELL_PERCENT_AMOUNT"),
         );
         payload.insert("errorCode".to_owned(), json!("SELL_SIZE_INVALID"));
         payload.insert("retryable".to_owned(), json!(false));
