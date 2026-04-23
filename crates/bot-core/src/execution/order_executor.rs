@@ -1556,24 +1556,181 @@ async fn attach_post_fill_sell_limit(
         return result;
     }
 
-    let trigger_before_close_sec = config.post_fill_sell_trigger_before_close_sec;
-    if trigger_before_close_sec > 0 {
-        let trigger_at_sec = close_time_sec.saturating_sub(trigger_before_close_sec);
+    let trigger_check_close_second = config.trigger_check_price_close_second;
+    if trigger_check_close_second > 0 {
+        let trigger_at_sec = close_time_sec.saturating_sub(trigger_check_close_second);
         let now = now_sec();
         if now < trigger_at_sec {
             let wait_sec = trigger_at_sec.saturating_sub(now);
             log_info(
                 "Exit",
                 &format!(
-                    "attempt #{} post-fill SELL scheduled at t-{}s; waiting {}s",
-                    attempt, trigger_before_close_sec, wait_sec
+                    "attempt #{} post-fill SELL check-price scheduled at t-{}s; waiting {}s",
+                    attempt, trigger_check_close_second, wait_sec
                 ),
             );
             sleep_ms(wait_sec.saturating_mul(1_000)).await;
         }
     }
 
-    let placement = submit_post_fill_sell_limit(config, client, token_id, result.filled_size).await;
+    let trigger_price_percent = config.trigger_price_percent;
+    let reference_fill_price = if result.filled_price.is_finite() && result.filled_price > 0.0 {
+        result.filled_price
+    } else {
+        config.post_fill_sell_limit_price
+    };
+    let trigger_computed_sell_limit_price =
+        clamp_price(reference_fill_price * (1.0 - trigger_price_percent));
+    let interval_check_price_ms = config.interval_check_price_ms.max(1);
+    let retry_check_price = config.retry_check_price.max(1);
+
+    let mut check_price_attempt = 0_u64;
+    let mut check_price_error_count = 0_u64;
+    let mut check_price_observed_best_bid = 0.0_f64;
+    let mut check_price_triggered = false;
+
+    for check_idx in 1..=retry_check_price {
+        check_price_attempt = check_idx;
+
+        match fetch_orderbook_snapshot(config, token_id).await {
+            Ok(orderbook) => {
+                if orderbook.best_bid.is_finite() {
+                    check_price_observed_best_bid = orderbook.best_bid.max(0.0);
+                }
+
+                if check_price_observed_best_bid > 0.0
+                    && check_price_observed_best_bid <= trigger_computed_sell_limit_price
+                {
+                    check_price_triggered = true;
+                    break;
+                }
+            }
+            Err(error) => {
+                check_price_error_count += 1;
+                log_warn(
+                    "Exit",
+                    &format!(
+                        "attempt #{} post-fill SELL check price {}/{} failed: {}",
+                        attempt,
+                        check_idx,
+                        retry_check_price,
+                        compact_error_message(&format_error_chain(&error), 180)
+                    ),
+                );
+            }
+        }
+
+        if check_idx < retry_check_price {
+            sleep_ms(interval_check_price_ms).await;
+        }
+    }
+
+    if !check_price_triggered {
+        let requested_size_from_percent = result.filled_size * config.post_fill_sell_percent_amount;
+        let mut placement = build_post_fill_sell_limit_payload(
+            token_id,
+            config.post_fill_sell_limit_price,
+            round_size_to_6_decimals(requested_size_from_percent),
+        );
+        placement.insert("filledSize".to_owned(), json!(result.filled_size));
+        placement.insert(
+            "sellPercentAmount".to_owned(),
+            json!(config.post_fill_sell_percent_amount),
+        );
+        placement.insert(
+            "requestedSizeFromPercent".to_owned(),
+            json!(requested_size_from_percent),
+        );
+        placement.insert("checkPriceTriggered".to_owned(), json!(false));
+        placement.insert("checkPriceAttempt".to_owned(), json!(check_price_attempt));
+        placement.insert("checkPriceRetry".to_owned(), json!(retry_check_price));
+        placement.insert(
+            "checkPriceIntervalMs".to_owned(),
+            json!(interval_check_price_ms),
+        );
+        placement.insert(
+            "checkPriceErrorCount".to_owned(),
+            json!(check_price_error_count),
+        );
+        placement.insert(
+            "checkPriceObservedBestBid".to_owned(),
+            json!(check_price_observed_best_bid),
+        );
+        placement.insert(
+            "triggerPricePercent".to_owned(),
+            json!(trigger_price_percent),
+        );
+        placement.insert(
+            "triggerComputedSellLimitPrice".to_owned(),
+            json!(trigger_computed_sell_limit_price),
+        );
+        placement.insert(
+            "triggerCheckPriceCloseSecond".to_owned(),
+            json!(trigger_check_close_second),
+        );
+        placement.insert("status".to_owned(), json!("check_price_not_triggered"));
+        placement.insert(
+            "errorCode".to_owned(),
+            json!("SELL_LIMIT_TRIGGER_PRICE_NOT_REACHED"),
+        );
+        placement.insert(
+            "errorMsg".to_owned(),
+            json!("sell limit skipped because trigger price check was not reached"),
+        );
+        placement.insert("retryable".to_owned(), json!(false));
+
+        log_warn(
+            "Exit",
+            &format!(
+                "attempt #{} post-fill SELL skipped: trigger price not reached bestBid={:.3} triggerPrice={:.3} (fill={:.3}, dropPercent={:.3}) checks={}/{}",
+                attempt,
+                check_price_observed_best_bid,
+                trigger_computed_sell_limit_price,
+                reference_fill_price,
+                trigger_price_percent,
+                check_price_attempt,
+                retry_check_price
+            ),
+        );
+
+        let mut raw_response = result.raw_response.clone();
+        raw_response.insert("postFillSellLimit".to_owned(), Value::Object(placement));
+
+        return ExecutionResult {
+            raw_response,
+            ..result
+        };
+    }
+
+    let mut placement =
+        submit_post_fill_sell_limit(config, client, token_id, result.filled_size).await;
+    placement.insert("checkPriceTriggered".to_owned(), json!(true));
+    placement.insert("checkPriceAttempt".to_owned(), json!(check_price_attempt));
+    placement.insert("checkPriceRetry".to_owned(), json!(retry_check_price));
+    placement.insert(
+        "checkPriceIntervalMs".to_owned(),
+        json!(interval_check_price_ms),
+    );
+    placement.insert(
+        "checkPriceErrorCount".to_owned(),
+        json!(check_price_error_count),
+    );
+    placement.insert(
+        "checkPriceObservedBestBid".to_owned(),
+        json!(check_price_observed_best_bid),
+    );
+    placement.insert(
+        "triggerPricePercent".to_owned(),
+        json!(trigger_price_percent),
+    );
+    placement.insert(
+        "triggerComputedSellLimitPrice".to_owned(),
+        json!(trigger_computed_sell_limit_price),
+    );
+    placement.insert(
+        "triggerCheckPriceCloseSecond".to_owned(),
+        json!(trigger_check_close_second),
+    );
 
     let success = placement
         .get("success")

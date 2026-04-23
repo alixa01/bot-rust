@@ -70,8 +70,14 @@ npm install
   Maximum number of post-fill SELL submit attempts before SELL is cancelled (skipped) with diagnostics.
 - `POST_FILL_SELL_PERCENT_AMOUNT`:
   Fraction of filled position to sell via post-fill SELL limit. Example: `0.5` means sell `50%` of filled size. Valid range: `> 0` and `<= 1.0`.
-- `POST_FILL_SELL_TRIGGER_BEFORE_CLOSE_SECONDS`:
-  Delays post-fill SELL placement until `t-N` before market close. Example: `8` means SELL starts at `t-8s`. Use `0` for immediate placement after fill.
+- `TRIGGER_CHECK_PRICE_CLOSE_SECOND`:
+  Starts post-fill SELL price-check loop at `t-N` before market close. Example: `8` means price checking starts at `t-8s`.
+- `TRIGGER_PRICE_PERCENT`:
+  Percentage drop from BUY `filled_price` to derive trigger price for post-fill SELL flow. Example: if filled at `0.8` and value is `0.2`, trigger price becomes `0.64`.
+- `INTERVAL_CHECK_PRICE_MS`:
+  Delay in milliseconds between each trigger price check.
+- `RETRY_CHECK_PRICE`:
+  Number of trigger price checks before skipping SELL due to trigger not reached.
 
 ## Run
 
